@@ -9,6 +9,8 @@ This interactive script helps you import official ICD-10 diagnosis codes into an
 
 Alternatively check out this tho no implemantation for its import is present https://gist.githubusercontent.com/cryocaustik/b86de96e66489ada97c25fc25f755de0/raw/b31a549638a609004e9a45f8933c3f37bdf4c27d/icd10_codes.json
 
+Its main gist is here and already has the basic code and usage for you; https://gist.github.com/cryocaustik/b86de96e66489ada97c25fc25f755de0
+
 ## Prerequisites
 
 - Docker installed and running
