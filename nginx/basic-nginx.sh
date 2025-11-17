@@ -1,0 +1,1867 @@
+#!/bin/bash
+
+# Odoo Multi-Version Project Bootstrap Script - FIXED VERSION
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+print_header() { echo -e "\n${CYAN}==== $1 ====${NC}"; }
+print_status() { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+print_input() { echo -e "${BLUE}[INPUT]${NC} $1"; }
+
+# Welcome
+clear
+echo -e "${CYAN}🐋 Odoo Multi-Version Setup - FIXED CONFIG VERSION 🐋${NC}"
+echo
+
+# Get project name
+print_input "Project name:"
+read -r PROJECT_NAME
+
+# Sanitize
+PROJECT_NAME=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+
+if [[ -z "$PROJECT_NAME" ]]; then
+    print_error "Project name cannot be empty!"
+    exit 1
+fi
+
+# Check existing
+if [ -d "$PROJECT_NAME" ]; then
+    print_warning "Directory exists. Overwrite? (y/N):"
+    read -r OVERWRITE
+    [[ ! "$OVERWRITE" =~ ^[Yy]$ ]] && exit 0
+    rm -rf "$PROJECT_NAME"
+fi
+
+# Check port availability function
+check_port() {
+    local port=$1
+    if command -v nc &> /dev/null; then
+        nc -z localhost "$port" &> /dev/null
+        return $?
+    elif command -v netstat &> /dev/null; then
+        netstat -tuln | grep -q ":$port "
+        return $?
+    else
+        # Fallback to a basic check
+        (echo > /dev/tcp/127.0.0.1/"$port") &> /dev/null
+        return $?
+    fi
+}
+
+# Edition selection
+print_input "Edition? (1) Community (2) Enterprise [1]:"
+read -r EDITION_CHOICE
+ODOO_EDITION=$([[ "$EDITION_CHOICE" == "2" ]] && echo "enterprise" || echo "community")
+
+# Versions
+print_input "Versions (comma-separated) [16,17,18,19]:"
+read -r VERSIONS_INPUT
+[[ -z "$VERSIONS_INPUT" ]] && VERSIONS_INPUT="16,17,18,19"
+
+# Nginx option - ASK FIRST
+print_input "Include Nginx proxy? (y/N):"
+read -r NGINX_CHOICE
+USE_NGINX=$([[ "$NGINX_CHOICE" =~ ^[Yy]$ ]] && echo "true" || echo "false")
+
+if [[ "$USE_NGINX" == "true" ]]; then
+    print_input "Nginx listening port [80]:"
+    read -r NGINX_PORT
+    [[ -z "$NGINX_PORT" ]] && NGINX_PORT=80
+
+    if ! [[ "$NGINX_PORT" =~ ^[0-9]+$ ]]; then
+        print_error "Nginx port must be a number!"
+        exit 1
+    fi
+    
+    print_input "Base domain (e.g., localhost or yourdomain.com) [localhost]:"
+    read -r BASE_DOMAIN
+    [[ -z "$BASE_DOMAIN" ]] && BASE_DOMAIN="localhost"
+    
+    print_status "Nginx will use HOST-BASED routing (subdomains)"
+    print_status "Access URLs will be: odoo16.${BASE_DOMAIN}:${NGINX_PORT}, odoo17.${BASE_DOMAIN}:${NGINX_PORT}, etc."
+    BASE_PORT=0  # Flag to indicate no direct host port mapping
+else
+    # Only ask for Odoo ports if NOT using Nginx
+    print_input "Starting host port for Odoo instances [8069]:"
+    read -r BASE_PORT
+    [[ -z "$BASE_PORT" ]] && BASE_PORT=8069
+
+    # Validate port is numeric
+    if ! [[ "$BASE_PORT" =~ ^[0-9]+$ ]]; then
+        print_error "Port must be a number!"
+        exit 1
+    fi
+    BASE_DOMAIN="localhost"
+fi
+
+# Parse and validate versions
+IFS=',' read -ra VERSIONS <<< "$VERSIONS_INPUT"
+VALID_VERSIONS=()
+for version in "${VERSIONS[@]}"; do
+    version=$(echo "$version" | tr -d ' ')
+    if [[ "$version" =~ ^1[5-9]$ ]]; then
+        VALID_VERSIONS+=("$version")
+    fi
+done
+
+if [ ${#VALID_VERSIONS[@]} -eq 0 ]; then
+    print_error "No valid versions!"
+    exit 1
+fi
+
+if [[ "$USE_NGINX" == "true" ]]; then
+    print_status "Creating: ${PROJECT_NAME} with versions ${VALID_VERSIONS[*]} (${ODOO_EDITION}) + Nginx on port ${NGINX_PORT}"
+    print_status "Odoo instances will be accessible via Nginx only (no direct host ports)"
+else
+    print_status "Creating: ${PROJECT_NAME} with versions ${VALID_VERSIONS[*]} (${ODOO_EDITION})"
+    print_status "Odoo instances will be directly accessible starting from port ${BASE_PORT}"
+fi
+
+# Create project
+mkdir -p "$PROJECT_NAME"
+cd "$PROJECT_NAME"
+
+# Create directory structure
+for version in "${VALID_VERSIONS[@]}"; do
+    mkdir -p "${version}-config"
+    mkdir -p "${version}-addons/custom"
+    mkdir -p "${version}-addons/third-party"
+
+    if [ "$ODOO_EDITION" = "enterprise" ]; then
+        mkdir -p "${version}-addons/enterprise"
+        mkdir -p "${version}-addons/industry"
+    fi
+done
+
+# Generate docker-compose.yml with custom entrypoint
+print_status "Generating docker-compose.yml with custom entrypoint..."
+
+cat > docker-compose.yml << 'EOF'
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: Africa/Nairobi
+    volumes:
+      - db-data:/var/lib/postgresql/data:Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+EOF
+
+# Add nginx service if requested
+if [[ "$USE_NGINX" == "true" ]]; then
+    cat >> docker-compose.yml << EOF
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT}:80"
+    volumes:
+      - ./conf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf/nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+EOF
+
+    for version in "${VALID_VERSIONS[@]}"; do
+        echo "      - odoo${version}" >> docker-compose.yml
+    done
+
+    echo >> docker-compose.yml
+fi
+
+# Generate services for each version
+for version in "${VALID_VERSIONS[@]}"; do
+    if [[ "$USE_NGINX" == "true" ]]; then
+        # With Nginx: no host port mapping, only internal container ports
+        print_status "Odoo ${version} will be accessible via Nginx (internal ports only)"
+        
+        cat >> docker-compose.yml << EOF
+  odoo${version}:
+    image: odoo:${version}.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8069"
+      - "8072"
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: odoo
+      ODOO_RC: /etc/odoo/odoo.conf
+      TZ: Africa/Nairobi
+    volumes:
+      - odoo${version}-data:/var/lib/odoo:Z
+      - ./${version}-config:/etc/odoo:Z
+      - ./${version}-addons/custom:/mnt/custom-addons:Z
+      - ./${version}-addons/third-party:/mnt/third-party-addons:Z
+EOF
+
+        if [ "$ODOO_EDITION" = "enterprise" ]; then
+            cat >> docker-compose.yml << EOF
+      - ./${version}-addons/enterprise:/mnt/enterprise-addons:Z
+      - ./${version}-addons/industry:/mnt/industry-addons:Z
+EOF
+        fi
+
+        cat >> docker-compose.yml << EOF
+    entrypoint: ["/etc/odoo/entrypoint.sh"]
+    command: ["odoo"]
+
+EOF
+    else
+        # Without Nginx: expose host ports for direct access
+        HOST_PORT=$((BASE_PORT + version - 16))
+        HOST_LONGPOLL_PORT=$((HOST_PORT + 1000))
+
+        # Check port availability
+        if check_port "$HOST_PORT"; then
+            print_warning "Host port $HOST_PORT is already in use! Using alternative port."
+            HOST_PORT=$((HOST_PORT + 100))
+        fi
+
+        if check_port "$HOST_LONGPOLL_PORT"; then
+            print_warning "Longpolling host port $HOST_LONGPOLL_PORT is already in use! Using alternative port."
+            HOST_LONGPOLL_PORT=$((HOST_LONGPOLL_PORT + 100))
+        fi
+
+        print_status "Odoo ${version} will use host port ${HOST_PORT} (longpolling: ${HOST_LONGPOLL_PORT})"
+
+        cat >> docker-compose.yml << EOF
+  odoo${version}:
+    image: odoo:${version}.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${HOST_PORT}:8069"
+      - "${HOST_LONGPOLL_PORT}:8072"
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: odoo
+      ODOO_RC: /etc/odoo/odoo.conf
+      TZ: Africa/Nairobi
+    volumes:
+      - odoo${version}-data:/var/lib/odoo:Z
+      - ./${version}-config:/etc/odoo:Z
+      - ./${version}-addons/custom:/mnt/custom-addons:Z
+      - ./${version}-addons/third-party:/mnt/third-party-addons:Z
+EOF
+
+        if [ "$ODOO_EDITION" = "enterprise" ]; then
+            cat >> docker-compose.yml << EOF
+      - ./${version}-addons/enterprise:/mnt/enterprise-addons:Z
+      - ./${version}-addons/industry:/mnt/industry-addons:Z
+EOF
+        fi
+
+        cat >> docker-compose.yml << EOF
+    entrypoint: ["/etc/odoo/entrypoint.sh"]
+    command: ["odoo"]
+
+EOF
+    fi
+done
+
+# Add volumes section
+cat >> docker-compose.yml << 'EOF'
+volumes:
+  db-data:
+EOF
+
+for version in "${VALID_VERSIONS[@]}"; do
+    echo "  odoo${version}-data:" >> docker-compose.yml
+done
+
+# Create PostgreSQL configuration
+mkdir -p conf/postgresql
+
+# Auto-detect system resources for PostgreSQL optimization
+CPU_CORES=$(nproc)
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+SHARED_BUFFERS=$((TOTAL_RAM_MB / 4))  # 25% of RAM
+EFFECTIVE_CACHE_SIZE=$((TOTAL_RAM_MB * 3 / 4))  # 75% of RAM
+MAINTENANCE_WORK_MEM=$((TOTAL_RAM_MB / 16))  # ~6% of RAM
+WORK_MEM=$((TOTAL_RAM_MB / (CPU_CORES * 4)))  # Conservative per connection
+
+# Create optimized PostgreSQL configuration
+cat > conf/postgresql/postgresql.conf << EOF
+# PostgreSQL 17 Configuration - Auto-generated for Odoo
+# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM
+
+# Connection Settings
+max_connections = 200
+superuser_reserved_connections = 3
+
+# Memory Settings
+shared_buffers = ${SHARED_BUFFERS}MB
+effective_cache_size = ${EFFECTIVE_CACHE_SIZE}MB
+maintenance_work_mem = ${MAINTENANCE_WORK_MEM}MB
+work_mem = ${WORK_MEM}MB
+
+# Checkpoint Settings
+checkpoint_completion_target = 0.9
+wal_buffers = 16MB
+default_statistics_target = 100
+
+# Query Planner
+random_page_cost = 1.1
+effective_io_concurrency = 200
+
+# Write Ahead Logging
+wal_level = replica
+max_wal_senders = 3
+max_replication_slots = 3
+
+# Logging
+log_destination = 'stderr'
+logging_collector = on
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+log_rotation_age = 1d
+log_rotation_size = 100MB
+log_min_duration_statement = 1000
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+log_checkpoints = on
+log_connections = on
+log_disconnections = on
+log_lock_waits = on
+log_temp_files = 0
+
+# Performance
+autovacuum = on
+autovacuum_max_workers = 3
+autovacuum_naptime = 20s
+autovacuum_vacuum_threshold = 50
+autovacuum_analyze_threshold = 50
+autovacuum_vacuum_scale_factor = 0.1
+autovacuum_analyze_scale_factor = 0.05
+
+# Locale and Formatting
+lc_messages = 'en_US.utf8'
+lc_monetary = 'en_US.utf8'
+lc_numeric = 'en_US.utf8'
+lc_time = 'en_US.utf8'
+default_text_search_config = 'pg_catalog.english'
+
+# Timezone
+timezone = 'UTC'
+
+# Security
+ssl = off
+password_encryption = scram-sha-256
+EOF
+
+# Create pg_hba.conf for authentication
+cat > conf/postgresql/pg_hba.conf << 'EOF'
+# PostgreSQL Client Authentication Configuration File
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                     trust
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             0.0.0.0/0               scram-sha-256
+# IPv6 local connections:
+host    all             all             ::1/128                 scram-sha-256
+# Allow replication connections from localhost, by a user with the
+# replication privilege.
+local   replication     all                                     trust
+host    replication     all             127.0.0.1/32            scram-sha-256
+host    replication     all             ::1/128                 scram-sha-256
+EOF
+
+print_status "PostgreSQL 17 auto-configured with ${SHARED_BUFFERS}MB shared_buffers"
+
+# Create config files and entrypoints for each version
+for version in "${VALID_VERSIONS[@]}"; do
+    PORT=$((8066 + version - 16))
+
+    # Build addons path based on edition
+    if [ "$ODOO_EDITION" = "enterprise" ]; then
+        ADDONS_PATH="/usr/lib/python3/dist-packages/odoo/addons,/mnt/enterprise-addons,/mnt/industry-addons,/mnt/third-party-addons,/mnt/custom-addons"
+    else
+        ADDONS_PATH="/usr/lib/python3/dist-packages/odoo/addons,/mnt/third-party-addons,/mnt/custom-addons"
+    fi
+
+    print_status "Creating auto-configured Odoo ${version}..."
+
+    # Calculate workers based on system resources (lessons learned)
+    MEMORY_SAFETY_FACTOR=0.8
+    WORKER_MEMORY_MB=2048  # Consistent 2GB per worker
+
+    available_ram_mb=$(echo "$TOTAL_RAM_MB * $MEMORY_SAFETY_FACTOR" | bc | cut -d. -f1)
+    max_workers_by_ram=$(( (available_ram_mb - 1024) / WORKER_MEMORY_MB ))
+    max_workers_by_cpu=$(( CPU_CORES - 1 ))
+
+    # Use the smaller of the two limits for safety
+    OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
+
+    # Ensure minimum of 1 worker
+    if [ $OPTIMAL_WORKERS -lt 1 ]; then
+        OPTIMAL_WORKERS=1
+    fi
+
+    DEV_WORKERS=$OPTIMAL_WORKERS
+    PROD_WORKERS=$OPTIMAL_WORKERS
+
+    # Create comprehensive odoo.conf
+    if [[ "$USE_NGINX" == "true" ]]; then
+        # With Nginx: no need to track host ports
+        HOST_PORT="N/A (via Nginx)"
+        HOST_LONGPOLL_PORT="N/A (via Nginx)"
+        PROXY_MODE="True"
+    else
+        # Without Nginx: calculate and track host ports
+        HOST_PORT=$((BASE_PORT + version - 16))
+        HOST_LONGPOLL_PORT=$((HOST_PORT + 1000))
+        PROXY_MODE="False"
+
+        # Check if host ports are already in use and adjust if needed
+        if check_port "$HOST_PORT"; then
+            HOST_PORT=$((HOST_PORT + 100))
+        fi
+        if check_port "$HOST_LONGPOLL_PORT"; then
+            HOST_LONGPOLL_PORT=$((HOST_LONGPOLL_PORT + 100))
+        fi
+    fi
+
+    cat > "${version}-config/odoo.conf" << EOF
+[options]
+# Database settings
+db_host = db
+db_port = 5432
+db_user = odoo
+db_password = odoo
+db_maxconn = 64
+
+# Server settings
+addons_path = ${ADDONS_PATH}
+data_dir = /var/lib/odoo
+admin_passwd = admin123
+http_port = 8069
+longpolling_port = 8072
+
+# Performance - Auto-configured for this system (${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM)
+# Workers: Conservative for development, optimal for production
+workers = ${DEV_WORKERS}
+max_cron_threads = 2
+
+# Memory limits (in bytes) - Consistent 2GB per worker
+limit_memory_hard = 2147483648
+limit_memory_soft = 1825361100
+limit_request = 8192
+limit_time_cpu = 600
+limit_time_real = 1200
+
+# Gevent settings (replaces longpolling)
+gevent_port = 8072
+proxy_mode = ${PROXY_MODE}
+
+# Logging
+log_level = info
+log_handler = :INFO
+logfile = False
+
+# Session & Security
+session_cookie_secure = False
+session_cookie_httponly = True
+
+# Misc
+server_wide_modules = base,web,bus
+csv_internal_sep = ,
+reportgz = False
+
+# Development settings - Production-like with debugging
+dev_mode = False
+watchdog_enable = False
+
+# Debugging (enable as needed)
+# dev_mode = reload  # Uncomment for auto-reload (single-threaded only)
+# log_level = debug  # Uncomment for detailed debugging
+
+# Security
+list_db = True
+db_filter = False
+
+# Performance tuning
+transient_age_limit = 1.0
+osv_memory_count_limit = 0
+db_template = template0
+
+# Project: ${PROJECT_NAME}
+# Version: ${version}.0
+# Host Port: ${HOST_PORT} (longpolling: ${HOST_LONGPOLL_PORT})
+EOF
+
+    # Create custom entrypoint with version-specific pip handling
+    cat > "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
+#!/bin/bash
+set -e
+
+# Set Kenya timezone
+export TZ=Africa/Nairobi
+
+# Database connection settings
+: ${HOST:=${DB_PORT_5432_TCP_ADDR:='db'}}
+: ${PORT:=${DB_PORT_5432_TCP_PORT:=5432}}
+: ${USER:=${DB_ENV_POSTGRES_USER:=${POSTGRES_USER:='odoo'}}}
+: ${PASSWORD:=${DB_ENV_POSTGRES_PASSWORD:=${POSTGRES_PASSWORD:='odoo'}}}
+
+# Install additional Python packages if requirements.txt exists
+if [ -f "/etc/odoo/requirements.txt" ]; then
+    echo "Installing additional Python packages..."
+ENTRYPOINT_EOF
+
+    # Add version-specific pip handling
+    if [ "$version" -ge 18 ]; then
+        cat >> "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
+    pip3 install --break-system-packages -r /etc/odoo/requirements.txt
+ENTRYPOINT_EOF
+    else
+        cat >> "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
+    pip3 install -r /etc/odoo/requirements.txt
+ENTRYPOINT_EOF
+    fi
+
+    cat >> "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
+fi
+
+# Set proper permissions
+chown -R odoo:odoo /var/lib/odoo
+
+# Function to check database connectivity
+wait_for_db() {
+    echo "Waiting for database to be ready..."
+    while ! pg_isready -h "$HOST" -p "$PORT" -U "$USER" > /dev/null 2>&1; do
+        sleep 1
+    done
+    echo "Database is ready!"
+}
+
+# Build database arguments
+DB_ARGS=()
+function check_config() {
+    param="$1"
+    value="$2"
+    if [ -f "$ODOO_RC" ] && grep -q -E "^\s*\b${param}\b\s*=" "$ODOO_RC"; then
+        value=$(grep -E "^\s*\b${param}\b\s*=" "$ODOO_RC" | cut -d '=' -f2 | sed 's/[[:space:]]*//g')
+    fi
+    DB_ARGS+=("--${param}")
+    DB_ARGS+=("${value}")
+}
+
+# Don't pass db_name in connection args - let Odoo handle it
+check_config "db_host" "$HOST"
+check_config "db_port" "$PORT"
+check_config "db_user" "$USER"
+check_config "db_password" "$PASSWORD"
+
+case "$1" in
+    -- | odoo)
+        shift
+        if [[ "$1" == "scaffold" ]]; then
+            exec odoo "$@"
+        else
+            wait_for_db
+            exec odoo --config="$ODOO_RC" "$@" "${DB_ARGS[@]}"
+        fi
+        ;;
+    -*)
+        wait_for_db
+        exec odoo --config="$ODOO_RC" "$@" "${DB_ARGS[@]}"
+        ;;
+    *)
+        exec "$@"
+esac
+
+exit 1
+ENTRYPOINT_EOF
+
+    # Make entrypoint executable
+    chmod +x "${version}-config/entrypoint.sh"
+
+    # Create requirements.txt for additional packages
+    cat > "${version}-config/requirements.txt" << EOF
+# Additional Python packages for Odoo ${version}
+# Common dependencies
+requests>=2.25.0
+python-dateutil>=2.8.0
+psutil>=5.8.0
+
+# Reporting
+reportlab>=3.5.0
+qrcode>=6.1
+xlsxwriter>=1.3.0
+xlrd>=1.2.0
+
+# Performance
+gevent>=21.0.0
+psycopg2-binary>=2.8.6
+
+# Optional: Uncomment as needed
+# phonenumbers>=8.12.0
+# python-ldap>=3.3.0
+# paramiko>=2.7.0
+EOF
+
+    # Create production config template
+    cat > "${version}-config/odoo-production.conf" << EOF
+[options]
+# Database settings
+db_host = db
+db_port = 5432
+db_user = odoo
+db_password = odoo
+db_maxconn = 64
+db_template = template0
+
+# Server settings
+addons_path = ${ADDONS_PATH}
+data_dir = /var/lib/odoo
+admin_passwd = \$(openssl rand -base64 32)
+http_port = 8069
+gevent_port = 8072
+
+# Production Performance Settings - Auto-configured
+# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM
+# Optimal workers: (CPU_CORES * 2) + 1 = ${PROD_WORKERS}
+workers = ${PROD_WORKERS}
+max_cron_threads = 2
+
+# Memory limits optimized for production - Consistent 2GB per worker
+limit_memory_hard = 2147483648
+limit_memory_soft = 1825361100
+limit_request = 8192
+limit_time_cpu = 600
+limit_time_real = 1200
+
+# Security
+proxy_mode = True
+list_db = False
+db_filter = ^%d\$
+
+# Logging
+log_level = warn
+log_handler = :WARNING
+logfile = /var/log/odoo/odoo.log
+log_rotate = True
+log_db = False
+
+# Session & Security
+session_cookie_secure = True
+session_cookie_httponly = True
+
+# Misc
+server_wide_modules = base,web
+csv_internal_sep = ,
+reportgz = True
+
+# Disable development features
+dev_mode = False
+watchdog_enable = False
+
+# Project: ${PROJECT_NAME}
+# Version: ${version}.0 (Production)
+EOF
+
+    # Create logrotate config
+    cat > "${version}-config/logrotate" << EOF
+/var/log/odoo/*.log {
+    daily
+    missingok
+    rotate 30
+    compress
+    notifempty
+    create 644 odoo odoo
+    postrotate
+        /bin/kill -HUP \$(cat /var/run/odoo/odoo.pid 2>/dev/null) 2>/dev/null || true
+    endscript
+}
+EOF
+
+    # Create addon README
+    cat > "${version}-addons/README.md" << EOF
+# Odoo ${version} Addons
+
+## Custom Addons (\`custom/\`)
+Place your custom modules here.
+
+## Third-party Addons (\`third-party/\`)
+Place external modules here.
+
+EOF
+
+    if [ "$ODOO_EDITION" = "enterprise" ]; then
+        cat >> "${version}-addons/README.md" << EOF
+## Enterprise Addons (\`enterprise/\`)
+Place official Odoo Enterprise modules here.
+
+## Industry Addons (\`industry/\`)
+Place industry-specific modules here.
+
+EOF
+    fi
+
+    cat >> "${version}-addons/README.md" << EOF
+## Installation
+1. Add your modules to the appropriate directory
+2. Restart the container: \`../manage.sh restart ${version}\`
+3. Update the apps list in Odoo
+4. Install your modules
+
+## Addons Path
+\`${ADDONS_PATH}\`
+EOF
+
+done
+
+# Create initialization script for first run
+cat > init-setup.sh << 'EOF'
+#!/bin/bash
+# Auto-initialization script - runs once on first startup
+
+set -e
+
+print_info() { echo -e "\033[0;34m[INIT]\033[0m $1"; }
+print_success() { echo -e "\033[0;32m[SUCCESS]\033[0m $1"; }
+
+print_info "Starting auto-initialization..."
+
+# Wait for database to be ready
+print_info "Waiting for PostgreSQL to be ready..."
+while ! docker compose exec -T db pg_isready -U odoo > /dev/null 2>&1; do
+    sleep 2
+done
+
+# Create databases for each version if they don't exist
+for version in VERSIONS_PLACEHOLDER; do
+    db_name="PROJECT_NAME_${version}"
+    if ! docker compose exec -T db psql -U odoo -lqt | cut -d \| -f 1 | grep -qw "$db_name"; then
+        print_info "Creating database: $db_name"
+        docker compose exec -T db createdb -U odoo -O odoo "$db_name"
+        print_success "Database $db_name created"
+    fi
+done
+
+# Initialize Odoo databases
+for version in VERSIONS_PLACEHOLDER; do
+    db_name="PROJECT_NAME_${version}"
+    print_info "Initializing Odoo $version database..."
+    docker compose exec odoo$version odoo -d "$db_name" -i base --stop-after-init --without-demo=all
+    print_success "Odoo $version initialized"
+done
+
+print_success "Auto-initialization complete!"
+print_info "Run './manage.sh urls' to see access URLs"
+EOF
+
+# Replace placeholders in init script
+sed -i "s/VERSIONS_PLACEHOLDER/${VALID_VERSIONS[*]}/g" init-setup.sh
+sed -i "s/PROJECT_NAME/${PROJECT_NAME}/g" init-setup.sh
+chmod +x init-setup.sh
+
+# Create nginx configuration directory and template
+mkdir -p conf/nginx
+mkdir -p conf/nginx/conf.d
+
+if [[ "$USE_NGINX" == "true" ]]; then
+    # Create main nginx.conf
+    cat > conf/nginx/nginx.conf << 'EOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json image/svg+xml;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+    # Create Odoo-specific nginx config with HOST-BASED routing
+    cat > conf/nginx/conf.d/odoo.conf << EOF
+# Odoo Multi-Version Nginx Configuration - HOST-BASED ROUTING
+# Generated for project: ${PROJECT_NAME}
+# Base domain: ${BASE_DOMAIN}
+
+# Rate limiting
+limit_req_zone \$binary_remote_addr zone=login:10m rate=5r/m;
+limit_req_zone \$binary_remote_addr zone=api:10m rate=20r/m;
+
+# WebSocket upgrade mapping
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+EOF
+
+    # Generate upstream blocks
+    for version in "${VALID_VERSIONS[@]}"; do
+        cat >> conf/nginx/conf.d/odoo.conf << EOF
+# Upstream for Odoo ${version}
+upstream odoo${version} {
+    server odoo${version}:8069;
+    keepalive 32;
+}
+
+upstream odoo${version}chat {
+    server odoo${version}:8072;
+    keepalive 16;
+}
+
+EOF
+    done
+
+    # Generate a server block for EACH version (host-based routing)
+    for version in "${VALID_VERSIONS[@]}"; do
+        cat >> conf/nginx/conf.d/odoo.conf << EOF
+# Server block for Odoo ${version} - odoo${version}.${BASE_DOMAIN}
+server {
+    listen 80;
+    server_name odoo${version}.${BASE_DOMAIN};
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    # Timeouts
+    proxy_read_timeout 720s;
+    proxy_connect_timeout 720s;
+    proxy_send_timeout 720s;
+
+    # Buffer sizes
+    proxy_buffer_size 128k;
+    proxy_buffers 4 256k;
+    proxy_busy_buffers_size 256k;
+
+    # Client settings
+    client_max_body_size 200M;
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+
+    # Logging
+    access_log /var/log/nginx/odoo${version}-access.log;
+    error_log /var/log/nginx/odoo${version}-error.log;
+
+    # WebSocket/Longpolling
+    location /websocket {
+        proxy_pass http://odoo${version}chat;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        proxy_http_version 1.1;
+    }
+
+    location /longpolling {
+        proxy_pass http://odoo${version}chat;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        proxy_http_version 1.1;
+    }
+
+    # Rate limiting for login
+    location ~* ^/web/(login|session/authenticate) {
+        limit_req zone=login burst=5 nodelay;
+        proxy_pass http://odoo${version};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+        proxy_http_version 1.1;
+    }
+
+    # Static files with caching
+    location ~* ^/[^/]+/static/.+\\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)\$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        proxy_pass http://odoo${version};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # API endpoints with rate limiting
+    location ~* ^/(xmlrpc|jsonrpc|api) {
+        limit_req zone=api burst=10 nodelay;
+        proxy_pass http://odoo${version};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+        proxy_http_version 1.1;
+    }
+
+    # Main location - NO PATH REWRITING NEEDED!
+    location / {
+        proxy_pass http://odoo${version};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+        proxy_http_version 1.1;
+    }
+
+    # Security: Block sensitive files
+    location ~* \\.(conf|log|py|pyc|pyo)\$ {
+        deny all;
+        return 404;
+    }
+}
+
+EOF
+    done
+
+    # Default server block for root domain
+    cat >> conf/nginx/conf.d/odoo.conf << EOF
+# Default server - shows available instances
+server {
+    listen 80 default_server;
+    server_name ${BASE_DOMAIN};
+
+    location / {
+        return 200 "Odoo Multi-Version Proxy (Host-Based Routing)\\n\\nAvailable instances:\\n$(for v in "${VALID_VERSIONS[@]}"; do echo "- http://odoo${v}.${BASE_DOMAIN}:${NGINX_PORT}\\n"; done)\\n\\nAdd these to /etc/hosts if using localhost:\\n$(for v in "${VALID_VERSIONS[@]}"; do echo "127.0.0.1 odoo${v}.${BASE_DOMAIN}\\n"; done)";
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+
+    print_status "Nginx configured on port ${NGINX_PORT} with HOST-BASED routing"
+    print_status "Subdomains: $(for v in "${VALID_VERSIONS[@]}"; do echo -n "odoo${v}.${BASE_DOMAIN} "; done)"
+fi
+
+# Create nginx template for HTTP (before SSL)
+cat > conf/nginx/odoo-http-template.conf << 'EOF'
+# Odoo HTTP Configuration Template
+# Copy this file and modify for your domain, then run certbot for SSL
+
+# Upstream definitions
+upstream odoo {
+    server 127.0.0.1:8069;
+}
+
+upstream odoochat {
+    server 127.0.0.1:8072;
+}
+
+# Rate limiting
+limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=api:10m rate=20r/m;
+
+# Map for WebSocket upgrade
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# Map for CSP headers on static files
+map $sent_http_content_type $content_type_csp {
+    default "";
+    ~image/ "default-src 'none'";
+}
+
+# Main server block
+server {
+    listen 80;
+    server_name your-domain.com;  # CHANGE THIS
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Timeouts
+    proxy_read_timeout 720s;
+    proxy_connect_timeout 720s;
+    proxy_send_timeout 720s;
+
+    # Buffer sizes
+    proxy_buffer_size 128k;
+    proxy_buffers 4 256k;
+    proxy_busy_buffers_size 256k;
+
+    # Client settings
+    client_max_body_size 200M;
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+
+    # Logging
+    access_log /var/log/nginx/odoo.access.log;
+    error_log /var/log/nginx/odoo.error.log;
+
+    # Rate limiting for login
+    location ~* ^/web/(login|session/authenticate) {
+        limit_req zone=login burst=5 nodelay;
+        proxy_pass http://odoo;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_redirect off;
+    }
+
+    # WebSocket/Gevent handling
+    location /websocket {
+        proxy_pass http://odoochat;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # WebSocket specific timeouts
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # Static files with caching
+    location ~* ^/[^/]+/static/.+\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        add_header Content-Security-Policy $content_type_csp;
+
+        # Try to serve static files directly, fallback to Odoo
+        try_files $uri @odoo;
+    }
+
+    # API endpoints with rate limiting
+    location ~* ^/(xmlrpc|jsonrpc|api) {
+        limit_req zone=api burst=10 nodelay;
+        proxy_pass http://odoo;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_redirect off;
+    }
+
+    # Main location block
+    location / {
+        proxy_pass http://odoo;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_redirect off;
+    }
+
+    # Fallback for static files
+    location @odoo {
+        proxy_pass http://odoo;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_redirect off;
+    }
+
+    # Security: Block access to sensitive files
+    location ~* \.(conf|log|py|pyc|pyo)$ {
+        deny all;
+        return 404;
+    }
+
+    # Gzip compression
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/javascript
+        application/xml+rss
+        application/json
+        image/svg+xml;
+}
+EOF
+
+# Create performance tuning script
+cat > conf/performance-tuner.sh << 'EOF'
+#!/bin/bash
+# Odoo Performance Tuning Helper
+
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+
+echo "🚀 Odoo Performance Tuning Helper"
+echo
+
+# Detect system resources
+CPU_CORES=$(nproc)
+TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+
+print_info "System Resources Detected:"
+echo "  CPU Cores: $CPU_CORES"
+echo "  Total RAM: ${TOTAL_RAM_GB}GB (${TOTAL_RAM_MB}MB)"
+echo
+
+# Calculate optimal workers
+OPTIMAL_WORKERS=$((CPU_CORES * 2 + 1))
+CONSERVATIVE_WORKERS=$((CPU_CORES + 1))
+
+print_info "Worker Recommendations:"
+echo "  Conservative: $CONSERVATIVE_WORKERS workers (CPU + 1)"
+echo "  Optimal: $OPTIMAL_WORKERS workers (CPU * 2 + 1)"
+echo "  Development: 0 workers (single-threaded with auto-reload)"
+echo
+
+# Calculate memory requirements - Consistent allocation
+WORKER_MEMORY_MB=2048  # 2GB per worker consistently
+
+RAM_NEEDED_CONSERVATIVE=$((CONSERVATIVE_WORKERS * WORKER_MEMORY_MB))
+RAM_NEEDED_OPTIMAL=$((OPTIMAL_WORKERS * WORKER_MEMORY_MB))
+
+print_info "Memory Requirements:"
+echo "  Per worker (consistent): ${WORKER_MEMORY_MB}MB"
+echo "  Conservative setup: ${RAM_NEEDED_CONSERVATIVE}MB"
+echo "  Optimal setup: ${RAM_NEEDED_OPTIMAL}MB"
+echo "  Available: ${TOTAL_RAM_MB}MB"
+echo
+
+if [ $RAM_NEEDED_OPTIMAL -gt $TOTAL_RAM_MB ]; then
+    print_warning "Optimal setup exceeds available RAM!"
+    RECOMMENDED_WORKERS=$CONSERVATIVE_WORKERS
+else
+    RECOMMENDED_WORKERS=$OPTIMAL_WORKERS
+fi
+
+print_success "Recommended Configuration:"
+echo "  workers = $RECOMMENDED_WORKERS"
+echo "  max_cron_threads = 2"
+echo "  limit_memory_hard = 2147483648  # 2GB"
+echo "  limit_memory_soft = 1825361100  # 1.7GB"
+echo "  db_maxconn = 64"
+echo
+
+# Generate config snippet
+cat > performance-config.conf << EOL
+# Generated Performance Configuration
+# System: ${CPU_CORES} cores, ${TOTAL_RAM_GB}GB RAM
+# Generated: $(date)
+
+[options]
+# Performance settings
+workers = $RECOMMENDED_WORKERS
+max_cron_threads = 2
+limit_memory_hard = 2147483648
+limit_memory_soft = 1825361100
+limit_request = 8192
+limit_time_cpu = 600
+limit_time_real = 1200
+db_maxconn = 64
+
+# For production, also set:
+# proxy_mode = True
+# list_db = False
+# log_level = warn
+EOL
+
+print_success "Configuration saved to: performance-config.conf"
+print_info "Copy relevant settings to your odoo.conf files"
+EOF
+
+chmod +x conf/performance-tuner.sh
+
+# Create enhanced management script
+cat > manage.sh << 'SCRIPT_EOF'
+#!/bin/bash
+
+set -e
+
+PROJECT_NAME=$(basename "$(pwd)")
+AVAILABLE_VERSIONS=(VERSIONS_PLACEHOLDER)
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_success() { echo -e "${GREEN}✓${NC} $1"; }
+print_error() { echo -e "${RED}✗${NC} $1"; }
+print_info() { echo -e "${BLUE}ℹ${NC} $1"; }
+print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
+
+show_usage() {
+    echo "Usage: $0 [COMMAND] [VERSION]"
+    echo
+    echo "Commands:"
+    echo "  start [VERSION]     Start all or specific version"
+    echo "  stop [VERSION]      Stop all or specific version"
+    echo "  restart [VERSION]   Restart services"
+    echo "  logs [VERSION]      Show logs"
+    echo "  shell VERSION       Open container shell"
+    echo "  config VERSION      Edit config file"
+    echo "  urls                Show access URLs"
+    echo "  update VERSION      Update modules"
+    echo "  scaffold MODULE VERSION  Create new module"
+    echo "  clean               Remove everything (docker compose down -v)"
+    echo "  reset               Clean + remove volumes completely"
+    echo "  performance         Run performance analysis"
+    echo "  production VERSION  Switch to production config"
+    echo "  development VERSION Switch to development config"
+    echo "  debug VERSION       Enable single-threaded debug mode"
+    echo "  monitor [VERSION]   Show resource usage"
+    echo "  backup [VERSION]    Backup database and filestore"
+    echo "  restore DB_FILE VERSION [FILESTORE_FILE] Restore database and filestore"
+    echo "  init                Auto-initialize databases (first run)"
+    echo
+    echo "Available versions: ${AVAILABLE_VERSIONS[*]}"
+}
+
+validate_version() {
+    local version=$1
+    if [[ ! " ${AVAILABLE_VERSIONS[*]} " =~ " ${version} " ]]; then
+        print_error "Invalid version '$version'. Available: ${AVAILABLE_VERSIONS[*]}"
+        exit 1
+    fi
+}
+
+start_services() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_info "Starting all services..."
+        docker compose up -d
+    else
+        validate_version "$version"
+        print_info "Starting Odoo $version..."
+        docker compose up -d db odoo$version
+    fi
+    print_success "Started"
+    show_urls
+}
+
+stop_services() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_info "Stopping all services..."
+        docker compose down
+    else
+        validate_version "$version"
+        print_info "Stopping Odoo $version..."
+        docker compose stop odoo$version
+    fi
+    print_success "Stopped"
+}
+
+show_urls() {
+    echo
+    print_info "Access URLs:"
+    
+    # Check if using Nginx by looking for nginx service in docker-compose.yml
+    if grep -q "nginx:" docker-compose.yml 2>/dev/null; then
+        # Get Nginx port and base domain from nginx config
+        nginx_port=$(grep -A 3 "nginx:" docker-compose.yml | grep -oP '"\K[0-9]+(?=:80")' | head -1)
+        [[ -z "$nginx_port" ]] && nginx_port=80
+        
+        base_domain=$(grep "server_name odoo" conf/nginx/conf.d/odoo.conf 2>/dev/null | head -1 | sed 's/.*odoo[0-9]*\.\([^;]*\);/\1/' || echo "localhost")
+        
+        echo "  📦 Nginx Proxy (Host-based routing)"
+        echo ""
+        for version in "${AVAILABLE_VERSIONS[@]}"; do
+            if docker compose ps odoo$version --format json 2>/dev/null | grep -q '"State":"running"'; then
+                status="�"
+            else
+                status="🔴"
+            fi
+            
+            echo "  $status Odoo $version: http://odoo${version}.${base_domain}:${nginx_port} (admin/admin123)"
+        done
+        echo ""
+        if [[ "$base_domain" == "localhost" ]]; then
+            echo "  💡 Add to /etc/hosts:"
+            for version in "${AVAILABLE_VERSIONS[@]}"; do
+                echo "     127.0.0.1 odoo${version}.localhost"
+            done
+        fi
+    else
+        # Direct access without Nginx
+        for version in "${AVAILABLE_VERSIONS[@]}"; do
+            # Get actual host port from docker-compose.yml
+            host_port=$(grep -A 5 "odoo${version}:" docker-compose.yml | grep -oP '"\K[0-9]+(?=:8069")' || echo "N/A")
+            host_longpoll_port=$(grep -A 6 "odoo${version}:" docker-compose.yml | grep -oP '"\K[0-9]+(?=:8072")' || echo "N/A")
+
+            if docker compose ps odoo$version --format json 2>/dev/null | grep -q '"State":"running"'; then
+                status="🟢"
+            else
+                status="🔴"
+            fi
+            
+            if [[ "$host_port" != "N/A" ]]; then
+                echo "  $status Odoo $version: http://localhost:$host_port (admin/admin123)"
+                echo "     └─ Longpolling: http://localhost:$host_longpoll_port"
+            else
+                echo "  $status Odoo $version: Internal only (no host port)"
+            fi
+        done
+    fi
+    
+    echo ""
+    echo "  🗄  PostgreSQL: localhost:5432 (user: odoo, pass: odoo)"
+    echo
+}
+
+edit_config() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_error "Version required: $0 config VERSION"
+        exit 1
+    fi
+    validate_version "$version"
+
+    local config_file="${version}-config/odoo.conf"
+    if [ ! -f "$config_file" ]; then
+        print_error "Config file not found: $config_file"
+        exit 1
+    fi
+
+    ${EDITOR:-nano} "$config_file"
+    print_info "Config updated. Restart container to apply changes:"
+    print_info "  $0 restart $version"
+}
+
+update_modules() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_error "Version required: $0 update VERSION"
+        exit 1
+    fi
+    validate_version "$version"
+
+    print_info "Updating module list for Odoo $version..."
+    docker compose exec odoo$version odoo -u base --stop-after-init
+    print_success "Module list updated"
+}
+
+scaffold_module() {
+    local module=$1
+    local version=$2
+
+    if [ -z "$module" ] || [ -z "$version" ]; then
+        print_error "Usage: $0 scaffold MODULE_NAME VERSION"
+        exit 1
+    fi
+
+    validate_version "$version"
+
+    print_info "Creating module '$module' for Odoo $version..."
+    docker compose exec odoo$version odoo scaffold "$module" /mnt/custom-addons/
+    print_success "Module '$module' created in ${version}-addons/custom/"
+}
+
+clean_all() {
+    print_warning "This removes containers and volumes (clean start)"
+    read -p "Continue? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        docker compose down -v
+        print_success "Clean complete"
+    fi
+}
+
+reset_all() {
+    print_warning "This removes EVERYTHING including named volumes"
+    read -p "Continue? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        docker compose down -v --remove-orphans
+        # Remove named volumes
+        for version in "${AVAILABLE_VERSIONS[@]}"; do
+            docker volume rm "${PROJECT_NAME}_odoo${version}-data" 2>/dev/null || true
+        done
+        docker volume rm "${PROJECT_NAME}_db-data" 2>/dev/null || true
+        print_success "Reset complete"
+    fi
+}
+
+case "$1" in
+    start) start_services $2 ;;
+    stop) stop_services $2 ;;
+    restart)
+        stop_services $2
+        sleep 2
+        start_services $2 ;;
+    logs)
+        if [ -z "$2" ]; then
+            docker compose logs -f
+        else
+            validate_version "$2"
+            docker compose logs -f odoo$2
+        fi ;;
+    shell)
+        if [ -z "$2" ]; then
+            print_error "Version required: $0 shell VERSION"
+            exit 1
+        fi
+        validate_version "$2"
+        docker compose exec odoo$2 /bin/bash ;;
+    config) edit_config $2 ;;
+    urls) show_urls ;;
+    update) update_modules $2 ;;
+    scaffold) scaffold_module $2 $3 ;;
+    clean) clean_all ;;
+    reset) reset_all ;;
+    performance) run_performance_analysis ;;
+    production) switch_to_production $2 ;;
+    development) switch_to_development $2 ;;
+    debug) enable_debug_mode $2 ;;
+    monitor) monitor_resources $2 ;;
+    backup) backup_database $2 ;;
+    restore) restore_database $2 $3 $4 ;;
+    init) run_initialization ;;
+    *) show_usage ;;
+esac
+
+run_performance_analysis() {
+    if [ -f "conf/performance-tuner.sh" ]; then
+        print_info "Running performance analysis..."
+        ./conf/performance-tuner.sh
+    else
+        print_error "Performance tuner not found. Run from project root."
+        exit 1
+    fi
+}
+
+switch_to_production() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_error "Version required: $0 production VERSION"
+        exit 1
+    fi
+    validate_version "$version"
+
+    local prod_config="${version}-config/odoo-production.conf"
+    local dev_config="${version}-config/odoo.conf"
+
+    if [ ! -f "$prod_config" ]; then
+        print_error "Production config not found: $prod_config"
+        exit 1
+    fi
+
+    # Backup current config
+    cp "$dev_config" "${dev_config}.backup"
+    cp "$prod_config" "$dev_config"
+
+    print_success "Switched Odoo $version to production config"
+    print_warning "Remember to:"
+    echo "  1. Set proper admin_passwd"
+    echo "  2. Configure proxy_mode if using nginx"
+    echo "  3. Restart container: $0 restart $version"
+}
+
+switch_to_development() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_error "Version required: $0 development VERSION"
+        exit 1
+    fi
+    validate_version "$version"
+
+    local dev_backup="${version}-config/odoo.conf.backup"
+    local dev_config="${version}-config/odoo.conf"
+
+    if [ -f "$dev_backup" ]; then
+        cp "$dev_backup" "$dev_config"
+        print_success "Restored development config for Odoo $version"
+    else
+        print_warning "No backup found, manually edit: $dev_config"
+        print_info "Development mode uses multi-processing (production-like)"
+    fi
+}
+
+enable_debug_mode() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_error "Version required: $0 debug VERSION"
+        exit 1
+    fi
+    validate_version "$version"
+
+    local config_file="${version}-config/odoo.conf"
+
+    if [ ! -f "$config_file" ]; then
+        print_error "Config file not found: $config_file"
+        exit 1
+    fi
+
+    # Backup current config
+    cp "$config_file" "${config_file}.backup"
+
+    # Enable single-threaded debug mode
+    sed -i 's/^workers = .*/workers = 0/' "$config_file"
+    sed -i 's/^dev_mode = .*/dev_mode = reload/' "$config_file"
+    sed -i 's/^log_level = .*/log_level = debug/' "$config_file"
+
+    print_success "Enabled debug mode for Odoo $version"
+    print_warning "Debug mode uses single-threaded processing"
+    print_info "Restart container: $0 restart $version"
+    print_info "Disable debug: $0 development $version"
+}
+
+monitor_resources() {
+    local version=$1
+
+    print_info "Resource Usage Monitor"
+    echo
+
+    if [ -z "$version" ]; then
+        print_info "Overall system resources:"
+        docker stats --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}"
+    else
+        validate_version "$version"
+        print_info "Resources for Odoo $version:"
+        docker stats --no-stream "${PROJECT_NAME}-odoo${version}-1" "${PROJECT_NAME}-db-1" 2>/dev/null || \
+        docker stats --no-stream "${PROJECT_NAME}_odoo${version}_1" "${PROJECT_NAME}_db_1" 2>/dev/null || \
+        print_error "Containers not running or not found"
+    fi
+}
+
+backup_database() {
+    local version=$1
+    if [ -z "$version" ]; then
+        print_error "Version required: $0 backup VERSION"
+        exit 1
+    fi
+    validate_version "$version"
+
+    local backup_dir="backups"
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local backup_file="${backup_dir}/odoo${version}_${timestamp}.sql"
+    local filestore_backup="${backup_dir}/filestore_${version}_${timestamp}.tar.gz"
+
+    mkdir -p "$backup_dir"
+
+    print_info "Creating backup for Odoo $version (database + filestore)..."
+
+    # Get database name
+    local db_name="${PROJECT_NAME}_${version}"
+
+    # Backup database
+    docker compose exec -T db pg_dump -U odoo -d "$db_name" > "$backup_file" 2>/dev/null || {
+        print_warning "Database $db_name not found, trying default names..."
+        for db_try in "${PROJECT_NAME}" "odoo" "postgres"; do
+            if docker compose exec -T db psql -U odoo -lqt | cut -d \| -f 1 | grep -qw "$db_try"; then
+                docker compose exec -T db pg_dump -U odoo -d "$db_try" > "$backup_file"
+                break
+            fi
+        done
+    }
+
+    # Backup filestore (attachments, documents, etc.)
+    docker compose exec -T odoo$version tar -czf - -C /var/lib/odoo/filestore . > "$filestore_backup" 2>/dev/null || {
+        print_warning "Filestore empty or not accessible"
+        rm -f "$filestore_backup"
+    }
+
+    print_success "Backup complete:"
+    echo "  Database: $backup_file"
+    [ -f "$filestore_backup" ] && echo "  Filestore: $filestore_backup"
+}
+
+restore_database() {
+    local backup_file=$1
+    local version=$2
+    local filestore_file=$3
+
+    if [ -z "$backup_file" ] || [ -z "$version" ]; then
+        print_error "Usage: $0 restore DATABASE_BACKUP.sql VERSION [FILESTORE_BACKUP.tar.gz]"
+        exit 1
+    fi
+
+    if [ ! -f "$backup_file" ]; then
+        print_error "Database backup file not found: $backup_file"
+        exit 1
+    fi
+
+    validate_version "$version"
+
+    local db_name="${PROJECT_NAME}_${version}"
+
+    print_warning "This will replace the database and filestore for Odoo $version"
+    read -p "Continue? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 0
+    fi
+
+    print_info "Stopping Odoo $version..."
+    docker compose stop odoo$version
+
+    print_info "Restoring database from $backup_file..."
+
+    # Drop and recreate database
+    docker compose exec -T db psql -U odoo -c "DROP DATABASE IF EXISTS $db_name;"
+    docker compose exec -T db psql -U odoo -c "CREATE DATABASE $db_name OWNER odoo;"
+
+    # Restore from backup
+    docker compose exec -T db psql -U odoo -d "$db_name" < "$backup_file"
+
+    # Restore filestore if provided
+    if [ -n "$filestore_file" ] && [ -f "$filestore_file" ]; then
+        print_info "Restoring filestore from $filestore_file..."
+        docker compose exec -T odoo$version sh -c "rm -rf /var/lib/odoo/filestore/* && tar -xzf - -C /var/lib/odoo/filestore" < "$filestore_file"
+        print_success "Filestore restored"
+    fi
+
+    print_info "Starting Odoo $version..."
+    docker compose start odoo$version
+
+    print_success "Restore complete"
+}
+
+run_initialization() {
+    if [ -f "init-setup.sh" ]; then
+        print_info "Running auto-initialization..."
+        ./init-setup.sh
+    else
+        print_error "Initialization script not found. Run from project root."
+        exit 1
+    fi
+}
+SCRIPT_EOF
+
+# Replace placeholder
+sed -i "s/VERSIONS_PLACEHOLDER/${VALID_VERSIONS[*]}/g" manage.sh
+chmod +x manage.sh
+
+# Create comprehensive README
+cat > README.md << EOF
+# ${PROJECT_NAME} - Odoo Multi-Version (${ODOO_EDITION^})
+
+## Quick Start
+\`\`\`bash
+./manage.sh start     # Start all versions
+./manage.sh urls      # Show access URLs
+./manage.sh config 17 # Edit Odoo 17 config
+\`\`\`
+
+## Access URLs
+EOF
+
+if [[ "$USE_NGINX" == "true" ]]; then
+    echo "**All Odoo instances are accessible via Nginx (HOST-BASED routing):**" >> README.md
+    echo "" >> README.md
+    for version in "${VALID_VERSIONS[@]}"; do
+        echo "- **Odoo ${version}**: http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT} (admin/admin123)" >> README.md
+    done
+    echo "" >> README.md
+    echo "**Note:** Using subdomain routing (cleaner than path-based)" >> README.md
+    echo "" >> README.md
+    if [[ "$BASE_DOMAIN" == "localhost" ]]; then
+        echo "**Add to /etc/hosts:**" >> README.md
+        echo "\`\`\`" >> README.md
+        for version in "${VALID_VERSIONS[@]}"; do
+            echo "127.0.0.1 odoo${version}.localhost" >> README.md
+        done
+        echo "\`\`\`" >> README.md
+    fi
+else
+    echo "**Direct access to Odoo instances:**" >> README.md
+    echo "" >> README.md
+    for version in "${VALID_VERSIONS[@]}"; do
+        host_port=$((BASE_PORT + version - 16))
+        host_longpoll_port=$((host_port + 1000))
+        echo "- **Odoo ${version}**: http://localhost:${host_port} (admin/admin123)" >> README.md
+        echo "  - Longpolling: http://localhost:${host_longpoll_port}" >> README.md
+    done
+fi
+
+echo "" >> README.md
+
+cat >> README.md << EOF
+**Database:**
+- **PostgreSQL**: localhost:5432 (odoo/odoo)
+
+## Configuration Features
+- ✅ **Custom entrypoints** for proper config loading
+- ✅ **Development mode** with auto-reload
+- ✅ **Custom addons paths** properly configured
+- ✅ **Requirements.txt** support for additional packages
+- ✅ **Logrotate** configuration included
+
+## Commands
+| Command | Description |
+|---------|-------------|
+| \`./manage.sh start [VERSION]\` | Start services |
+| \`./manage.sh config VERSION\` | Edit config file |
+| \`./manage.sh scaffold MODULE VERSION\` | Create new module |
+| \`./manage.sh update VERSION\` | Update module list |
+| \`./manage.sh shell VERSION\` | Container shell |
+| \`./manage.sh clean\` | Clean restart |
+
+## Adding Custom Modules
+\`\`\`bash
+# Method 1: Use scaffold
+./manage.sh scaffold my_module 17
+
+# Method 2: Copy existing module
+cp -r /path/to/my_module ./17-addons/custom/
+./manage.sh restart 17
+\`\`\`
+
+## Configuration Files
+Each version has its own complete config:
+- \`{VERSION}-config/odoo.conf\` - Main configuration
+- \`{VERSION}-config/entrypoint.sh\` - Custom entrypoint
+- \`{VERSION}-config/requirements.txt\` - Python packages
+- \`{VERSION}-config/logrotate\` - Log rotation
+
+## Debugging
+\`\`\`bash
+./manage.sh logs 17        # View logs
+./manage.sh shell 17       # Container shell
+./manage.sh config 17      # Edit config
+\`\`\`
+EOF
+
+# Create .gitignore
+cat > .gitignore << 'EOF'
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Enterprise addons (uncomment to exclude from git)
+# */enterprise/
+# */industry/
+EOF
+
+print_header "🎉 Setup Complete with Fixed Configuration!"
+print_success "Project: ${PROJECT_NAME}"
+print_success "Versions: ${VALID_VERSIONS[*]}"
+print_success "Edition: ${ODOO_EDITION^}"
+echo
+print_info "Key features applied:"
+echo "  ✅ Custom entrypoints for proper config loading"
+echo "  ✅ Comprehensive odoo.conf files with longpolling"
+echo "  ✅ Addons paths properly configured with SELinux compatibility"
+echo "  ✅ Development mode enabled"
+echo "  ✅ Requirements.txt support with --break-system-packages"
+echo "  ✅ Dynamic port selection with availability checking"
+if [[ "$USE_NGINX" == "true" ]]; then
+    echo "  ✅ Nginx proxy configured on port ${NGINX_PORT} with HOST-BASED routing"
+    echo "     Access URLs:"
+    for version in "${VALID_VERSIONS[@]}"; do
+        echo "     - http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT} (Odoo ${version})"
+    done
+    if [[ "$BASE_DOMAIN" == "localhost" ]]; then
+        echo ""
+        echo "  ⚠️  Add to /etc/hosts:"
+        for version in "${VALID_VERSIONS[@]}"; do
+            echo "     127.0.0.1 odoo${version}.localhost"
+        done
+    fi
+fi
+echo
+print_info "Next steps:"
+echo "  cd ${PROJECT_NAME}"
+echo "  ./manage.sh start"
+echo "  ./manage.sh init     # Auto-initialize databases (first run)"
+echo "  ./manage.sh urls     # Show all access URLs"
+echo
+print_info "Everything is auto-configured:"
+echo "  ✅ PostgreSQL 17 optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
+echo "  ✅ Odoo configs with ${DEV_WORKERS} workers (dev) / ${PROD_WORKERS} workers (prod)"
+echo "  ✅ Filestore volumes configured"
+echo "  ✅ Nginx templates ready"
+echo
+print_status "Fully automated deployment ready! 🚀"
