@@ -17,7 +17,7 @@
 # Usage: ./autodeploy-nginx.sh
 #
 # Author: Community-driven
-# License: MIT
+# License: LGPL3
 #
 
 set -e
