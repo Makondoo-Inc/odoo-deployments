@@ -1,6 +1,23 @@
 #!/bin/bash
 
-# Odoo Multi-Version Project Bootstrap Script - FIXED VERSION
+# Odoo Multi-Version Deployment Script
+# 
+# Automated deployment tool for running multiple Odoo versions with optional Nginx reverse proxy.
+# Supports host-based routing with wildcard DNS (sslip.io) for zero-configuration local development.
+#
+# Features:
+# - Multi-version Odoo deployment (16, 17, 18, 19)
+# - Optional Nginx reverse proxy with host-based routing
+# - Wildcard DNS support (sslip.io) - no /etc/hosts editing required
+# - Auto-configured PostgreSQL 17 with performance tuning
+# - Docker Compose orchestration
+# - SELinux-compatible volume mounts
+# - Custom entrypoints with proper configuration loading
+#
+# Usage: ./autodeploy-nginx.sh
+#
+# Author: Community-driven
+# License: MIT
 
 set -e
 
@@ -21,7 +38,8 @@ print_input() { echo -e "${BLUE}[INPUT]${NC} $1"; }
 
 # Welcome
 clear
-echo -e "${CYAN}🐋 Odoo Multi-Version Setup - FIXED CONFIG VERSION 🐋${NC}"
+echo -e "${CYAN}Odoo Multi-Version Deployment Script${NC}"
+echo -e "${CYAN}Production-ready with optional Nginx reverse proxy${NC}"
 echo
 
 # Get project name
@@ -85,9 +103,29 @@ if [[ "$USE_NGINX" == "true" ]]; then
         exit 1
     fi
     
-    print_input "Base domain (e.g., localhost or yourdomain.com) [localhost]:"
-    read -r BASE_DOMAIN
-    [[ -z "$BASE_DOMAIN" ]] && BASE_DOMAIN="localhost"
+    print_header "Domain Configuration"
+    echo "1) Use 127-0-0-1.sslip.io (wildcard DNS, no /etc/hosts needed) [RECOMMENDED]"
+    echo "2) Use localhost (requires /etc/hosts entries)"
+    echo "3) Custom domain (e.g., yourdomain.com)"
+    print_input "Select option [1]:"
+    read -r DOMAIN_CHOICE
+    [[ -z "$DOMAIN_CHOICE" ]] && DOMAIN_CHOICE=1
+    
+    case "$DOMAIN_CHOICE" in
+        1)
+            BASE_DOMAIN="127-0-0-1.sslip.io"
+            print_success "Using sslip.io wildcard DNS"
+            ;;
+        2)
+            BASE_DOMAIN="localhost"
+            print_warning "Requires /etc/hosts configuration"
+            ;;
+        3)
+            print_input "Enter your domain:"
+            read -r BASE_DOMAIN
+            [[ -z "$BASE_DOMAIN" ]] && BASE_DOMAIN="localhost"
+            ;;
+    esac
     
     print_status "Nginx will use HOST-BASED routing (subdomains)"
     print_status "Access URLs will be: odoo16.${BASE_DOMAIN}:${NGINX_PORT}, odoo17.${BASE_DOMAIN}:${NGINX_PORT}, etc."
@@ -1264,10 +1302,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-print_success() { echo -e "${GREEN}✓${NC} $1"; }
-print_error() { echo -e "${RED}✗${NC} $1"; }
-print_info() { echo -e "${BLUE}ℹ${NC} $1"; }
-print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
+print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
 show_usage() {
     echo "Usage: $0 [COMMAND] [VERSION]"
@@ -1343,22 +1381,24 @@ show_urls() {
         
         base_domain=$(grep "server_name odoo" conf/nginx/conf.d/odoo.conf 2>/dev/null | head -1 | sed 's/.*odoo[0-9]*\.\([^;]*\);/\1/' || echo "localhost")
         
-        echo "  📦 Nginx Proxy (Host-based routing)"
+        echo "   Nginx Proxy (Host-based routing)"
         echo ""
         for version in "${AVAILABLE_VERSIONS[@]}"; do
             if docker compose ps odoo$version --format json 2>/dev/null | grep -q '"State":"running"'; then
                 status="�"
             else
-                status="🔴"
+                status="[STOPPED]"
             fi
             
             echo "  $status Odoo $version: http://odoo${version}.${base_domain}:${nginx_port} (admin/admin123)"
         done
         echo ""
-        if [[ "$base_domain" == "localhost" ]]; then
-            echo "  💡 Add to /etc/hosts:"
+        if [[ "$base_domain" == "127-0-0-1.sslip.io" ]]; then
+            echo "  Using sslip.io wildcard DNS (no /etc/hosts required)"
+        elif [[ "$base_domain" == "localhost" ]]; then
+            echo "  Add to /etc/hosts:"
             for version in "${AVAILABLE_VERSIONS[@]}"; do
-                echo "     127.0.0.1 odoo${version}.localhost"
+                echo "    sudo bash -c 'echo \"127.0.0.1 odoo${version}.localhost\" >> /etc/hosts'"
             done
         fi
     else
@@ -1369,9 +1409,9 @@ show_urls() {
             host_longpoll_port=$(grep -A 6 "odoo${version}:" docker-compose.yml | grep -oP '"\K[0-9]+(?=:8072")' || echo "N/A")
 
             if docker compose ps odoo$version --format json 2>/dev/null | grep -q '"State":"running"'; then
-                status="🟢"
+                status="[RUNNING]"
             else
-                status="🔴"
+                status="[STOPPED]"
             fi
             
             if [[ "$host_port" != "N/A" ]]; then
@@ -1384,7 +1424,7 @@ show_urls() {
     fi
     
     echo ""
-    echo "  🗄  PostgreSQL: localhost:5432 (user: odoo, pass: odoo)"
+    echo "    PostgreSQL: localhost:5432 (user: odoo, pass: odoo)"
     echo
 }
 
@@ -1726,20 +1766,29 @@ cat > README.md << EOF
 EOF
 
 if [[ "$USE_NGINX" == "true" ]]; then
-    echo "**All Odoo instances are accessible via Nginx (HOST-BASED routing):**" >> README.md
+    echo "**Nginx Reverse Proxy (Host-Based Routing)**" >> README.md
     echo "" >> README.md
     for version in "${VALID_VERSIONS[@]}"; do
         echo "- **Odoo ${version}**: http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT} (admin/admin123)" >> README.md
     done
     echo "" >> README.md
-    echo "**Note:** Using subdomain routing (cleaner than path-based)" >> README.md
-    echo "" >> README.md
-    if [[ "$BASE_DOMAIN" == "localhost" ]]; then
+    if [[ "$BASE_DOMAIN" == "127-0-0-1.sslip.io" ]]; then
+        echo "**Wildcard DNS Configuration**" >> README.md
+        echo "" >> README.md
+        echo "Using sslip.io for automatic DNS resolution - no /etc/hosts configuration required." >> README.md
+        echo "" >> README.md
+        echo "DNS Resolution:" >> README.md
+        for version in "${VALID_VERSIONS[@]}"; do
+            echo "- \`odoo${version}.127-0-0-1.sslip.io\` resolves to \`127.0.0.1\`" >> README.md
+        done
+    elif [[ "$BASE_DOMAIN" == "localhost" ]]; then
         echo "**Add to /etc/hosts:**" >> README.md
-        echo "\`\`\`" >> README.md
+        echo "\`\`\`bash" >> README.md
+        echo "sudo bash -c 'cat >> /etc/hosts << EOF" >> README.md
         for version in "${VALID_VERSIONS[@]}"; do
             echo "127.0.0.1 odoo${version}.localhost" >> README.md
         done
+        echo "EOF'" >> README.md
         echo "\`\`\`" >> README.md
     fi
 else
@@ -1825,43 +1874,38 @@ __pycache__/
 # */industry/
 EOF
 
-print_header "🎉 Setup Complete with Fixed Configuration!"
+print_header "Deployment Configuration Complete"
 print_success "Project: ${PROJECT_NAME}"
 print_success "Versions: ${VALID_VERSIONS[*]}"
 print_success "Edition: ${ODOO_EDITION^}"
 echo
-print_info "Key features applied:"
-echo "  ✅ Custom entrypoints for proper config loading"
-echo "  ✅ Comprehensive odoo.conf files with longpolling"
-echo "  ✅ Addons paths properly configured with SELinux compatibility"
-echo "  ✅ Development mode enabled"
-echo "  ✅ Requirements.txt support with --break-system-packages"
-echo "  ✅ Dynamic port selection with availability checking"
+print_info "Configuration Summary:"
+echo "  - Custom entrypoints with proper config loading"
+echo "  - PostgreSQL 17 optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
+echo "  - Odoo workers: ${DEV_WORKERS} (development) / ${PROD_WORKERS} (production)"
+echo "  - SELinux-compatible volume mounts"
+echo "  - Python requirements.txt support"
 if [[ "$USE_NGINX" == "true" ]]; then
-    echo "  ✅ Nginx proxy configured on port ${NGINX_PORT} with HOST-BASED routing"
-    echo "     Access URLs:"
+    echo "  - Nginx reverse proxy on port ${NGINX_PORT}"
+    echo
+    print_info "Access URLs:"
     for version in "${VALID_VERSIONS[@]}"; do
-        echo "     - http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT} (Odoo ${version})"
+        echo "  http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT}"
     done
-    if [[ "$BASE_DOMAIN" == "localhost" ]]; then
-        echo ""
-        echo "  ⚠️  Add to /etc/hosts:"
+    if [[ "$BASE_DOMAIN" == "127-0-0-1.sslip.io" ]]; then
+        echo
+        print_info "Using sslip.io wildcard DNS (no /etc/hosts required)"
+    elif [[ "$BASE_DOMAIN" == "localhost" ]]; then
+        echo
+        print_warning "Add to /etc/hosts:"
         for version in "${VALID_VERSIONS[@]}"; do
-            echo "     127.0.0.1 odoo${version}.localhost"
+            echo "  sudo bash -c 'echo \"127.0.0.1 odoo${version}.localhost\" >> /etc/hosts'"
         done
     fi
 fi
 echo
-print_info "Next steps:"
+print_info "Next Steps:"
 echo "  cd ${PROJECT_NAME}"
 echo "  ./manage.sh start"
-echo "  ./manage.sh init     # Auto-initialize databases (first run)"
-echo "  ./manage.sh urls     # Show all access URLs"
-echo
-print_info "Everything is auto-configured:"
-echo "  ✅ PostgreSQL 17 optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
-echo "  ✅ Odoo configs with ${DEV_WORKERS} workers (dev) / ${PROD_WORKERS} workers (prod)"
-echo "  ✅ Filestore volumes configured"
-echo "  ✅ Nginx templates ready"
-echo
-print_status "Fully automated deployment ready! 🚀"
+echo "  ./manage.sh init     # Initialize databases (first run)"
+echo "  ./manage.sh urls     # Display access information"
