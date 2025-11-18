@@ -160,7 +160,7 @@ Manual Odoo deployments are time-consuming and error-prone. This script eliminat
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/odoo-multi-deploy.git
+git clone https://github.com/Makondoo-Inc/odoo-deployments.git
 cd odoo-multi-deploy
 
 # Or download directly
