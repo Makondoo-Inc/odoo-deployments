@@ -164,7 +164,7 @@ git clone https://github.com/Makondoo-Inc/odoo-deployments.git
 cd odoo-multi-deploy
 
 # Or download directly
-wget https://raw.githubusercontent.com/yourusername/odoo-multi-deploy/main/autodeploy-nginx.sh
+wget https://raw.githubusercontent.com/Makondoo-Inc/odoo-deployments/refs/heads/main/nginx/autodeploy-%E2%80%8Bnginx.%E2%80%8Bsh
 chmod +x autodeploy-nginx.sh
 ```
 
@@ -1141,13 +1141,11 @@ Developed for the Odoo community by DevSecOps practitioners who believe in:
 
 ## Support & Community
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/odoo-multi-deploy/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/odoo-multi-deploy/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Makondoo-Inc/odoo-deployments/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Makondoo-Inc/odoo-deployments/discussions)
 - **Odoo Community**: [Official Forums](https://www.odoo.com/forum)
-- **Documentation**: [docs.claude.com](https://docs.claude.com)
 
 ---
 
 **Built with pragmatism. Deployed with confidence.**
-
-Deploy Odoo like a professional. Because life's too short for manual configuration.
+Because life's too short for manual configuration. ps this documentation was generated witht he help Of AI looks good to me feel free to contribute if you finad anything that needs fixing.
