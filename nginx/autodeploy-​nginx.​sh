@@ -496,6 +496,8 @@ db_port = 5432
 db_user = odoo
 db_password = odoo
 db_maxconn = 64
+# No default database - prevents auto-connection to wrong database
+db_name = False
 
 # Server settings
 addons_path = ${ADDONS_PATH}
@@ -544,7 +546,9 @@ watchdog_enable = False
 
 # Security
 list_db = True
-db_filter = False
+# Database filter: Match databases containing version number
+# Allows: test18, prod18, 18_anything, anything_18, etc.
+dbfilter = .*${version}.*
 
 # Performance tuning
 transient_age_limit = 1.0
@@ -1907,5 +1911,11 @@ echo
 print_info "Next Steps:"
 echo "  cd ${PROJECT_NAME}"
 echo "  ./manage.sh start"
-echo "  ./manage.sh init     # Initialize databases (first run)"
 echo "  ./manage.sh urls     # Display access information"
+echo
+print_warning "Database Naming Convention (REQUIRED):"
+echo "  Each version requires the version number in the database name to prevent conflicts"
+for version in "${VALID_VERSIONS[@]}"; do
+    echo "  - Odoo ${version}: Include '${version}' in name (e.g., test${version}, prod${version}, ${version}_db, my_${version}_app)"
+done
+echo "  This prevents version conflicts and cron job interference"
