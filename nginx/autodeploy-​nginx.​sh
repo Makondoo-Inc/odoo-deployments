@@ -17,8 +17,7 @@
 # Usage: ./autodeploy-nginx.sh
 #
 # Author: Community-driven
-# License: LGPL3
-#
+# License: MIT
 
 set -e
 
@@ -89,6 +88,33 @@ print_input "Versions (comma-separated) [16,17,18,19]:"
 read -r VERSIONS_INPUT
 [[ -z "$VERSIONS_INPUT" ]] && VERSIONS_INPUT="16,17,18,19"
 
+# Parse and validate versions immediately
+IFS=',' read -ra VERSIONS <<< "$VERSIONS_INPUT"
+VALID_VERSIONS=()
+for version in "${VERSIONS[@]}"; do
+    version=$(echo "$version" | tr -d ' ')
+    if [[ "$version" =~ ^1[5-9]$ ]]; then
+        VALID_VERSIONS+=("$version")
+    fi
+done
+
+if [ ${#VALID_VERSIONS[@]} -eq 0 ]; then
+    print_error "No valid versions!"
+    exit 1
+fi
+
+print_success "Valid versions: ${VALID_VERSIONS[*]}"
+
+# Odoo master password
+print_input "Odoo master password (leave empty for random):"
+read -rs ADMIN_PASSWD
+echo
+if [[ -z "$ADMIN_PASSWD" ]]; then
+    ADMIN_PASSWD=$(openssl rand -base64 32)
+    print_warning "Generated random password: ${ADMIN_PASSWD}"
+    print_warning "Save this password securely!"
+fi
+
 # Nginx option - ASK FIRST
 print_input "Include Nginx proxy? (y/N):"
 read -r NGINX_CHOICE
@@ -105,9 +131,9 @@ if [[ "$USE_NGINX" == "true" ]]; then
     fi
     
     print_header "Domain Configuration"
-    echo "1) Use 127-0-0-1.sslip.io (wildcard DNS, no /etc/hosts needed) [RECOMMENDED]"
-    echo "2) Use localhost (requires /etc/hosts entries)"
-    echo "3) Custom domain (e.g., yourdomain.com)"
+    echo "1) Use 127-0-0-1.sslip.io (wildcard DNS, no /etc/hosts needed) [RECOMMENDED for testing]"
+    echo "2) Use localhost (local testing)"
+    echo "3) Custom domain(s) - you specify EXACT domain for each version"
     print_input "Select option [1]:"
     read -r DOMAIN_CHOICE
     [[ -z "$DOMAIN_CHOICE" ]] && DOMAIN_CHOICE=1
@@ -115,21 +141,38 @@ if [[ "$USE_NGINX" == "true" ]]; then
     case "$DOMAIN_CHOICE" in
         1)
             BASE_DOMAIN="127-0-0-1.sslip.io"
-            print_success "Using sslip.io wildcard DNS"
+            DOMAIN_MODE="auto"
+            print_success "Using sslip.io - access at http://127-0-0-1.sslip.io:${NGINX_PORT}"
             ;;
         2)
             BASE_DOMAIN="localhost"
-            print_warning "Requires /etc/hosts configuration"
+            DOMAIN_MODE="auto"
+            print_success "Using localhost - access at http://localhost:${NGINX_PORT}"
             ;;
         3)
-            print_input "Enter your domain:"
-            read -r BASE_DOMAIN
-            [[ -z "$BASE_DOMAIN" ]] && BASE_DOMAIN="localhost"
+            DOMAIN_MODE="custom"
+            declare -A CUSTOM_DOMAINS
+            
+            if [ ${#VALID_VERSIONS[@]} -eq 1 ]; then
+                print_input "Enter your domain (e.g., portal.yourdomain.com):"
+                read -r CUSTOM_DOMAIN
+                [[ -z "$CUSTOM_DOMAIN" ]] && CUSTOM_DOMAIN="localhost"
+                CUSTOM_DOMAINS[${VALID_VERSIONS[0]}]="$CUSTOM_DOMAIN"
+                print_success "Odoo ${VALID_VERSIONS[0]} will be accessible at: http://${CUSTOM_DOMAIN}:${NGINX_PORT}"
+            else
+                echo ""
+                print_status "Enter domain for each Odoo version:"
+                for version in "${VALID_VERSIONS[@]}"; do
+                    print_input "Domain for Odoo ${version} (e.g., portal.client1.com):"
+                    read -r CUSTOM_DOMAIN
+                    [[ -z "$CUSTOM_DOMAIN" ]] && CUSTOM_DOMAIN="odoo${version}.localhost"
+                    CUSTOM_DOMAINS[$version]="$CUSTOM_DOMAIN"
+                    print_success "Odoo ${version} → http://${CUSTOM_DOMAIN}:${NGINX_PORT}"
+                done
+            fi
             ;;
     esac
     
-    print_status "Nginx will use HOST-BASED routing (subdomains)"
-    print_status "Access URLs will be: odoo16.${BASE_DOMAIN}:${NGINX_PORT}, odoo17.${BASE_DOMAIN}:${NGINX_PORT}, etc."
     BASE_PORT=0  # Flag to indicate no direct host port mapping
 else
     # Only ask for Odoo ports if NOT using Nginx
@@ -145,24 +188,13 @@ else
     BASE_DOMAIN="localhost"
 fi
 
-# Parse and validate versions
-IFS=',' read -ra VERSIONS <<< "$VERSIONS_INPUT"
-VALID_VERSIONS=()
-for version in "${VERSIONS[@]}"; do
-    version=$(echo "$version" | tr -d ' ')
-    if [[ "$version" =~ ^1[5-9]$ ]]; then
-        VALID_VERSIONS+=("$version")
-    fi
-done
-
-if [ ${#VALID_VERSIONS[@]} -eq 0 ]; then
-    print_error "No valid versions!"
-    exit 1
-fi
-
 if [[ "$USE_NGINX" == "true" ]]; then
     print_status "Creating: ${PROJECT_NAME} with versions ${VALID_VERSIONS[*]} (${ODOO_EDITION}) + Nginx on port ${NGINX_PORT}"
-    print_status "Odoo instances will be accessible via Nginx only (no direct host ports)"
+    if [[ "$DOMAIN_MODE" == "custom" ]]; then
+        print_status "Using custom domains as specified"
+    else
+        print_status "Using ${BASE_DOMAIN} for access"
+    fi
 else
     print_status "Creating: ${PROJECT_NAME} with versions ${VALID_VERSIONS[*]} (${ODOO_EDITION})"
     print_status "Odoo instances will be directly accessible starting from port ${BASE_PORT}"
@@ -184,13 +216,22 @@ for version in "${VALID_VERSIONS[@]}"; do
     fi
 done
 
+# Determine PostgreSQL version based on Odoo versions
+PG_VERSION="17"
+for version in "${VALID_VERSIONS[@]}"; do
+    if [ "$version" -ge 19 ]; then
+        PG_VERSION="18"
+        break
+    fi
+done
+
 # Generate docker-compose.yml with custom entrypoint
 print_status "Generating docker-compose.yml with custom entrypoint..."
 
-cat > docker-compose.yml << 'EOF'
+cat > docker-compose.yml << EOF
 services:
   db:
-    image: postgres:17
+    image: postgres:${PG_VERSION}
     restart: unless-stopped
     environment:
       POSTGRES_USER: odoo
@@ -200,6 +241,7 @@ services:
       TZ: Africa/Nairobi
     volumes:
       - db-data:/var/lib/postgresql/data:Z
+      - ./conf/postgresql:/etc/postgresql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U odoo"]
       interval: 10s
@@ -256,6 +298,7 @@ for version in "${VALID_VERSIONS[@]}"; do
       - ./${version}-config:/etc/odoo:Z
       - ./${version}-addons/custom:/mnt/custom-addons:Z
       - ./${version}-addons/third-party:/mnt/third-party-addons:Z
+      - ./${version}-logs:/var/log/odoo:Z
 EOF
 
         if [ "$ODOO_EDITION" = "enterprise" ]; then
@@ -309,6 +352,7 @@ EOF
       - ./${version}-config:/etc/odoo:Z
       - ./${version}-addons/custom:/mnt/custom-addons:Z
       - ./${version}-addons/third-party:/mnt/third-party-addons:Z
+      - ./${version}-logs:/var/log/odoo:Z
 EOF
 
         if [ "$ODOO_EDITION" = "enterprise" ]; then
@@ -349,7 +393,7 @@ WORK_MEM=$((TOTAL_RAM_MB / (CPU_CORES * 4)))  # Conservative per connection
 
 # Create optimized PostgreSQL configuration
 cat > conf/postgresql/postgresql.conf << EOF
-# PostgreSQL 17 Configuration - Auto-generated for Odoo
+# PostgreSQL ${PG_VERSION} Configuration - Auto-generated for Odoo
 # System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM
 
 # Connection Settings
@@ -434,7 +478,7 @@ host    replication     all             127.0.0.1/32            scram-sha-256
 host    replication     all             ::1/128                 scram-sha-256
 EOF
 
-print_status "PostgreSQL 17 auto-configured with ${SHARED_BUFFERS}MB shared_buffers"
+print_status "PostgreSQL ${PG_VERSION} auto-configured with ${SHARED_BUFFERS}MB shared_buffers"
 
 # Create config files and entrypoints for each version
 for version in "${VALID_VERSIONS[@]}"; do
@@ -491,21 +535,18 @@ for version in "${VALID_VERSIONS[@]}"; do
 
     cat > "${version}-config/odoo.conf" << EOF
 [options]
-# Database settings
+# Database
 db_host = db
 db_port = 5432
 db_user = odoo
 db_password = odoo
 db_maxconn = 64
-# No default database - prevents auto-connection to wrong database
-db_name = False
 
-# Server settings
+# Server
 addons_path = ${ADDONS_PATH}
 data_dir = /var/lib/odoo
-admin_passwd = admin123
+admin_passwd = ${ADMIN_PASSWD}
 http_port = 8069
-longpolling_port = 8072
 
 # Performance - Auto-configured for this system (${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM)
 # Workers: Conservative for development, optimal for production
@@ -519,42 +560,21 @@ limit_request = 8192
 limit_time_cpu = 600
 limit_time_real = 1200
 
-# Gevent settings (replaces longpolling)
+# Gevent
 gevent_port = 8072
 proxy_mode = ${PROXY_MODE}
 
 # Logging
 log_level = info
-log_handler = :INFO
-logfile = False
-
-# Session & Security
-session_cookie_secure = False
-session_cookie_httponly = True
-
-# Misc
-server_wide_modules = base,web,bus
-csv_internal_sep = ,
-reportgz = False
-
-# Development settings - Production-like with debugging
-dev_mode = False
-watchdog_enable = False
-
-# Debugging (enable as needed)
-# dev_mode = reload  # Uncomment for auto-reload (single-threaded only)
-# log_level = debug  # Uncomment for detailed debugging
+logfile = /var/log/odoo/odoo.log
 
 # Security
 list_db = True
-# Database filter: Match databases containing version number
-# Allows: test18, prod18, 18_anything, anything_18, etc.
 dbfilter = .*${version}.*
 
-# Performance tuning
+# Performance
 transient_age_limit = 1.0
 osv_memory_count_limit = 0
-db_template = template0
 
 # Project: ${PROJECT_NAME}
 # Version: ${version}.0
@@ -596,6 +616,7 @@ fi
 
 # Set proper permissions
 chown -R odoo:odoo /var/lib/odoo
+chown -R odoo:odoo /var/log/odoo
 
 # Function to check database connectivity
 wait_for_db() {
@@ -651,86 +672,20 @@ ENTRYPOINT_EOF
     # Create requirements.txt for additional packages
     cat > "${version}-config/requirements.txt" << EOF
 # Additional Python packages for Odoo ${version}
-# Common dependencies
 requests>=2.25.0
 python-dateutil>=2.8.0
 psutil>=5.8.0
-
-# Reporting
 reportlab>=3.5.0
 qrcode>=6.1
 xlsxwriter>=1.3.0
 xlrd>=1.2.0
-
-# Performance
 gevent>=21.0.0
 psycopg2-binary>=2.8.6
-
-# Optional: Uncomment as needed
-# phonenumbers>=8.12.0
-# python-ldap>=3.3.0
-# paramiko>=2.7.0
 EOF
 
-    # Create production config template
-    cat > "${version}-config/odoo-production.conf" << EOF
-[options]
-# Database settings
-db_host = db
-db_port = 5432
-db_user = odoo
-db_password = odoo
-db_maxconn = 64
-db_template = template0
-
-# Server settings
-addons_path = ${ADDONS_PATH}
-data_dir = /var/lib/odoo
-admin_passwd = \$(openssl rand -base64 32)
-http_port = 8069
-gevent_port = 8072
-
-# Production Performance Settings - Auto-configured
-# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM
-# Optimal workers: (CPU_CORES * 2) + 1 = ${PROD_WORKERS}
-workers = ${PROD_WORKERS}
-max_cron_threads = 2
-
-# Memory limits optimized for production - Consistent 2GB per worker
-limit_memory_hard = 2147483648
-limit_memory_soft = 1825361100
-limit_request = 8192
-limit_time_cpu = 600
-limit_time_real = 1200
-
-# Security
-proxy_mode = True
-list_db = False
-db_filter = ^%d\$
-
-# Logging
-log_level = warn
-log_handler = :WARNING
-logfile = /var/log/odoo/odoo.log
-log_rotate = True
-log_db = False
-
-# Session & Security
-session_cookie_secure = True
-session_cookie_httponly = True
-
-# Misc
-server_wide_modules = base,web
-csv_internal_sep = ,
-reportgz = True
-
-# Disable development features
-dev_mode = False
-watchdog_enable = False
-
-# Project: ${PROJECT_NAME}
-# Version: ${version}.0 (Production)
-EOF
+    # Create log directory
+    mkdir -p "${version}-logs" 2>/dev/null || true
+    chmod 777 "${version}-logs" 2>/dev/null || true
 
     # Create logrotate config
     cat > "${version}-config/logrotate" << EOF
@@ -906,18 +861,32 @@ upstream odoo${version}chat {
 EOF
     done
 
-    # Generate a server block for EACH version (host-based routing)
+    # Generate a server block for EACH version
     for version in "${VALID_VERSIONS[@]}"; do
+        if [[ "$DOMAIN_MODE" == "custom" ]]; then
+            # Custom domain: use EXACTLY what user specified
+            SERVER_NAME="${CUSTOM_DOMAINS[$version]}"
+        elif [[ "$DOMAIN_MODE" == "auto" ]]; then
+            # Auto mode: use base domain with version prefix for multiple versions
+            if [ ${#VALID_VERSIONS[@]} -eq 1 ]; then
+                SERVER_NAME="${BASE_DOMAIN}"
+            else
+                SERVER_NAME="odoo${version}.${BASE_DOMAIN}"
+            fi
+        fi
+        
         cat >> conf/nginx/conf.d/odoo.conf << EOF
-# Server block for Odoo ${version} - odoo${version}.${BASE_DOMAIN}
+# Server block for Odoo ${version} - ${SERVER_NAME}
 server {
     listen 80;
-    server_name odoo${version}.${BASE_DOMAIN};
+    server_name ${SERVER_NAME};
 
     # Security headers
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
 
     # Timeouts
     proxy_read_timeout 720s;
@@ -937,6 +906,18 @@ server {
     # Logging
     access_log /var/log/nginx/odoo${version}-access.log;
     error_log /var/log/nginx/odoo${version}-error.log;
+
+    # Block common attack patterns
+    location ~* (\.git|\.env|\.htaccess|\.svn|\.DS_Store|web\.config) {
+        deny all;
+        return 404;
+    }
+
+    # Block SQL injection attempts
+    location ~* (union.*select|insert.*into|drop.*table|update.*set|delete.*from) {
+        deny all;
+        return 403;
+    }
 
     # WebSocket/Longpolling
     location /websocket {
@@ -967,7 +948,7 @@ server {
         proxy_http_version 1.1;
     }
 
-    # Rate limiting for login
+    # Rate limiting for login (prevents brute force)
     location ~* ^/web/(login|session/authenticate) {
         limit_req zone=login burst=5 nodelay;
         proxy_pass http://odoo${version};
@@ -989,7 +970,7 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
-    # API endpoints with rate limiting
+    # API endpoints with rate limiting (prevents API abuse)
     location ~* ^/(xmlrpc|jsonrpc|api) {
         limit_req zone=api burst=10 nodelay;
         proxy_pass http://odoo${version};
@@ -1001,7 +982,7 @@ server {
         proxy_http_version 1.1;
     }
 
-    # Main location - NO PATH REWRITING NEEDED!
+    # Main location
     location / {
         proxy_pass http://odoo${version};
         proxy_set_header Host \$http_host;
@@ -1013,7 +994,7 @@ server {
     }
 
     # Security: Block sensitive files
-    location ~* \\.(conf|log|py|pyc|pyo)\$ {
+    location ~* \\.(conf|log|py|pyc|pyo|bak|sql|db)\$ {
         deny all;
         return 404;
     }
@@ -1022,15 +1003,15 @@ server {
 EOF
     done
 
-    # Default server block for root domain
+    # Default server block - catch-all for unmatched domains
     cat >> conf/nginx/conf.d/odoo.conf << EOF
-# Default server - shows available instances
+# Default server - shows available instances (catch-all)
 server {
     listen 80 default_server;
-    server_name ${BASE_DOMAIN};
+    server_name _;
 
     location / {
-        return 200 "Odoo Multi-Version Proxy (Host-Based Routing)\\n\\nAvailable instances:\\n$(for v in "${VALID_VERSIONS[@]}"; do echo "- http://odoo${v}.${BASE_DOMAIN}:${NGINX_PORT}\\n"; done)\\n\\nAdd these to /etc/hosts if using localhost:\\n$(for v in "${VALID_VERSIONS[@]}"; do echo "127.0.0.1 odoo${v}.${BASE_DOMAIN}\\n"; done)";
+        return 200 "Odoo Multi-Version Proxy (Host-Based Routing)\\n\\nAvailable instances:\\n$(for v in "${VALID_VERSIONS[@]}"; do echo "- http://odoo${v}.${BASE_DOMAIN}:${NGINX_PORT}\\n"; done)\\n\\nNote: Access via subdomains (odoo16.domain.com, odoo17.domain.com, etc.)";
         add_header Content-Type text/plain;
     }
 }
@@ -1038,6 +1019,77 @@ EOF
 
     print_status "Nginx configured on port ${NGINX_PORT} with HOST-BASED routing"
     print_status "Subdomains: $(for v in "${VALID_VERSIONS[@]}"; do echo -n "odoo${v}.${BASE_DOMAIN} "; done)"
+else
+    # No embedded Nginx - create host nginx template
+    print_status "Creating host Nginx template for external proxy..."
+    
+    for version in "${VALID_VERSIONS[@]}"; do
+        HOST_PORT=$((BASE_PORT + version - 16))
+        
+        cat > "conf/nginx-host-odoo${version}.conf" << EOF
+# Nginx configuration for Odoo ${version}
+# Copy to: /etc/nginx/sites-available/odoo${version}
+# Enable: ln -s /etc/nginx/sites-available/odoo${version} /etc/nginx/sites-enabled/
+# SSL: certbot --nginx -d yourdomain.com
+
+upstream odoo${version} {
+    server 127.0.0.1:${HOST_PORT};
+}
+
+upstream odoo${version}chat {
+    server 127.0.0.1:$((HOST_PORT + 1000));
+}
+
+server {
+    listen 80;
+    server_name yourdomain.com;  # CHANGE THIS
+
+    client_max_body_size 200M;
+    proxy_read_timeout 720s;
+    proxy_connect_timeout 720s;
+    proxy_send_timeout 720s;
+
+    # Logging
+    access_log /var/log/nginx/odoo${version}.access.log;
+    error_log /var/log/nginx/odoo${version}.error.log;
+
+    # WebSocket/Longpolling
+    location /websocket {
+        proxy_pass http://odoo${version}chat;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+    }
+
+    location /longpolling {
+        proxy_pass http://odoo${version}chat;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+    }
+
+    # Main location
+    location / {
+        proxy_pass http://odoo${version};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+    }
+}
+EOF
+    done
+    
+    print_success "Host Nginx templates created in conf/nginx-host-odoo*.conf"
 fi
 
 # Create nginx template for HTTP (before SSL)
@@ -1884,28 +1936,44 @@ print_success "Project: ${PROJECT_NAME}"
 print_success "Versions: ${VALID_VERSIONS[*]}"
 print_success "Edition: ${ODOO_EDITION^}"
 echo
-print_info "Configuration Summary:"
+print_status "Configuration Summary:"
 echo "  - Custom entrypoints with proper config loading"
-echo "  - PostgreSQL 17 optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
+echo "  - PostgreSQL ${PG_VERSION} optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
 echo "  - Odoo workers: ${DEV_WORKERS} (development) / ${PROD_WORKERS} (production)"
 echo "  - SELinux-compatible volume mounts"
 echo "  - Python requirements.txt support"
 if [[ "$USE_NGINX" == "true" ]]; then
     echo "  - Nginx reverse proxy on port ${NGINX_PORT}"
     echo
-    print_info "Access URLs:"
-    for version in "${VALID_VERSIONS[@]}"; do
-        echo "  http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT}"
-    done
-    if [[ "$BASE_DOMAIN" == "127-0-0-1.sslip.io" ]]; then
-        echo
-        print_info "Using sslip.io wildcard DNS (no /etc/hosts required)"
-    elif [[ "$BASE_DOMAIN" == "localhost" ]]; then
-        echo
-        print_warning "Add to /etc/hosts:"
+    print_status "Access URLs:"
+    if [[ "$DOMAIN_MODE" == "custom" ]]; then
         for version in "${VALID_VERSIONS[@]}"; do
-            echo "  sudo bash -c 'echo \"127.0.0.1 odoo${version}.localhost\" >> /etc/hosts'"
+            echo "  Odoo ${version}: http://${CUSTOM_DOMAINS[$version]}:${NGINX_PORT}"
         done
+        echo
+        print_warning "Ensure DNS records point to your server IP:"
+        for version in "${VALID_VERSIONS[@]}"; do
+            echo "  ${CUSTOM_DOMAINS[$version]} → $(hostname -I | awk '{print $1}')"
+        done
+    else
+        if [ ${#VALID_VERSIONS[@]} -eq 1 ]; then
+            echo "  http://${BASE_DOMAIN}:${NGINX_PORT}"
+        else
+            for version in "${VALID_VERSIONS[@]}"; do
+                echo "  http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT}"
+            done
+        fi
+        
+        if [[ "$BASE_DOMAIN" == "127-0-0-1.sslip.io" ]]; then
+            echo
+            print_status "Using sslip.io wildcard DNS (no /etc/hosts required)"
+        elif [[ "$BASE_DOMAIN" == "localhost" ]] && [ ${#VALID_VERSIONS[@]} -gt 1 ]; then
+            echo
+            print_warning "Add to /etc/hosts:"
+            for version in "${VALID_VERSIONS[@]}"; do
+                echo "  sudo bash -c 'echo \"127.0.0.1 odoo${version}.localhost\" >> /etc/hosts'"
+            done
+        fi
     fi
 fi
 echo
