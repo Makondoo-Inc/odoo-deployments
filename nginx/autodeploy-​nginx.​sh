@@ -31,6 +31,7 @@ NC='\033[0m'
 
 print_header() { echo -e "\n${CYAN}==== $1 ====${NC}"; }
 print_status() { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
@@ -287,6 +288,12 @@ for version in "${VALID_VERSIONS[@]}"; do
     expose:
       - "8069"
       - "8072"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8069/web/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     environment:
       HOST: db
       USER: odoo
@@ -341,6 +348,12 @@ EOF
     ports:
       - "${HOST_PORT}:8069"
       - "${HOST_LONGPOLL_PORT}:8072"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8069/web/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     environment:
       HOST: db
       USER: odoo
@@ -493,24 +506,44 @@ for version in "${VALID_VERSIONS[@]}"; do
 
     print_status "Creating auto-configured Odoo ${version}..."
 
-    # Calculate workers based on system resources (lessons learned)
+    # Calculate workers based on system resources
     MEMORY_SAFETY_FACTOR=0.8
-    WORKER_MEMORY_MB=2048  # Consistent 2GB per worker
-
     available_ram_mb=$(echo "$TOTAL_RAM_MB * $MEMORY_SAFETY_FACTOR" | bc | cut -d. -f1)
-    max_workers_by_ram=$(( (available_ram_mb - 1024) / WORKER_MEMORY_MB ))
-    max_workers_by_cpu=$(( CPU_CORES - 1 ))
+    
+    # Reserve 1GB for OS and DB
+    RESERVED_RAM=1024
+    
+    # Worker memory limits (in MB)
+    # If system has < 4GB RAM, use smaller workers
+    if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+        WORKER_MEMORY_MB=512
+        SOFT_LIMIT_MB=400
+    elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+        WORKER_MEMORY_MB=1024
+        SOFT_LIMIT_MB=800
+    else
+        WORKER_MEMORY_MB=2048
+        SOFT_LIMIT_MB=1600
+    fi
+
+    max_workers_by_ram=$(( (available_ram_mb - RESERVED_RAM) / WORKER_MEMORY_MB ))
+    max_workers_by_cpu=$(( CPU_CORES * 2 + 1 )) # Standard Odoo recommendation
 
     # Use the smaller of the two limits for safety
     OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
 
-    # Ensure minimum of 1 worker
+    # Ensure minimum of 2 workers (one for cron/longpoll, one for HTTP) if resources allow
     if [ $OPTIMAL_WORKERS -lt 1 ]; then
-        OPTIMAL_WORKERS=1
+        OPTIMAL_WORKERS=0 # Single-threaded if very low resources
+    elif [ $OPTIMAL_WORKERS -gt 8 ]; then
+        OPTIMAL_WORKERS=8 # Cap at 8 workers per version to avoid overwhelming DB
     fi
 
     DEV_WORKERS=$OPTIMAL_WORKERS
-    PROD_WORKERS=$OPTIMAL_WORKERS
+    
+    # Calculate bytes for Odoo config
+    HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
+    SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
 
     # Create comprehensive odoo.conf
     if [[ "$USE_NGINX" == "true" ]]; then
@@ -548,14 +581,13 @@ data_dir = /var/lib/odoo
 admin_passwd = ${ADMIN_PASSWD}
 http_port = 8069
 
-# Performance - Auto-configured for this system (${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM)
-# Workers: Conservative for development, optimal for production
+# Workers: Auto-configured for this system (${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM)
 workers = ${DEV_WORKERS}
 max_cron_threads = 2
 
-# Memory limits (in bytes) - Consistent 2GB per worker
-limit_memory_hard = 2147483648
-limit_memory_soft = 1825361100
+# Memory limits (in bytes) - Auto-calculated
+limit_memory_hard = ${HARD_LIMIT_BYTES}
+limit_memory_soft = ${SOFT_LIMIT_BYTES}
 limit_request = 8192
 limit_time_cpu = 600
 limit_time_real = 1200
@@ -627,6 +659,11 @@ wait_for_db() {
     echo "Database is ready!"
 }
 
+# Start logrotate in background
+if [ -f "/etc/odoo/logrotate" ]; then
+    (while true; do sleep 86400; logrotate /etc/odoo/logrotate; done) &
+fi
+
 # Build database arguments
 DB_ARGS=()
 function check_config() {
@@ -696,9 +733,6 @@ EOF
     compress
     notifempty
     create 644 odoo odoo
-    postrotate
-        /bin/kill -HUP \$(cat /var/run/odoo/odoo.pid 2>/dev/null) 2>/dev/null || true
-    endscript
 }
 EOF
 
@@ -766,11 +800,11 @@ for version in VERSIONS_PLACEHOLDER; do
     fi
 done
 
-# Initialize Odoo databases
+    # Initialize Odoo databases
 for version in VERSIONS_PLACEHOLDER; do
     db_name="PROJECT_NAME_${version}"
     print_info "Initializing Odoo $version database..."
-    docker compose exec odoo$version odoo -d "$db_name" -i base --stop-after-init --without-demo=all
+    docker compose exec odoo$version odoo --config=/etc/odoo/odoo.conf -d "$db_name" -i base --stop-after-init --without-demo=all
     print_success "Odoo $version initialized"
 done
 
@@ -1721,11 +1755,16 @@ backup_database() {
     local db_name="${PROJECT_NAME}_${version}"
 
     # Backup database
-    docker compose exec -T db pg_dump -U odoo -d "$db_name" > "$backup_file" 2>/dev/null || {
+    if docker compose exec -T db pg_dump -U odoo -d "$db_name" | gzip > "${backup_file}.gz.tmp" 2>/dev/null; then
+        mv "${backup_file}.gz.tmp" "${backup_file}.gz"
+        print_success "Database backup: ${backup_file}.gz"
+    else
+        rm -f "${backup_file}.gz.tmp"
         print_warning "Database $db_name not found, trying default names..."
         for db_try in "${PROJECT_NAME}" "odoo" "postgres"; do
             if docker compose exec -T db psql -U odoo -lqt | cut -d \| -f 1 | grep -qw "$db_try"; then
-                docker compose exec -T db pg_dump -U odoo -d "$db_try" > "$backup_file"
+                docker compose exec -T db pg_dump -U odoo -d "$db_try" | gzip > "${backup_file}.gz"
+                print_success "Database backup (${db_try}): ${backup_file}.gz"
                 break
             fi
         done
@@ -1777,8 +1816,12 @@ restore_database() {
     docker compose exec -T db psql -U odoo -c "DROP DATABASE IF EXISTS $db_name;"
     docker compose exec -T db psql -U odoo -c "CREATE DATABASE $db_name OWNER odoo;"
 
-    # Restore from backup
-    docker compose exec -T db psql -U odoo -d "$db_name" < "$backup_file"
+    # Restore from backup (handling compression)
+    if [[ "$backup_file" == *.gz ]]; then
+        gunzip -c "$backup_file" | docker compose exec -T db psql -U odoo -d "$db_name"
+    else
+        docker compose exec -T db psql -U odoo -d "$db_name" < "$backup_file"
+    fi
 
     # Restore filestore if provided
     if [ -n "$filestore_file" ] && [ -f "$filestore_file" ]; then
