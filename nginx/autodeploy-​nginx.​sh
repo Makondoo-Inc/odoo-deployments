@@ -1494,10 +1494,11 @@ show_urls() {
         fi
     else
         # Direct access without Nginx
+        local version_index=1
         for version in "${AVAILABLE_VERSIONS[@]}"; do
             # Get actual host port from docker-compose.yml
-            host_port=$(grep -A 5 "odoo${version}:" docker-compose.yml | grep -oP '"\K[0-9]+(?=:8069")' || echo "N/A")
-            host_longpoll_port=$(grep -A 6 "odoo${version}:" docker-compose.yml | grep -oP '"\K[0-9]+(?=:8072")' || echo "N/A")
+            host_port=$(grep -oP '"\K[0-9]+(?=:8069")' docker-compose.yml | sed -n "${version_index}p" 2>/dev/null || echo "N/A")
+            host_longpoll_port=$(grep -oP '"\K[0-9]+(?=:8072")' docker-compose.yml | sed -n "${version_index}p" 2>/dev/null || echo "N/A")
 
             if docker compose ps odoo$version --format json 2>/dev/null | grep -q '"State":"running"'; then
                 status="[RUNNING]"
@@ -1511,6 +1512,7 @@ show_urls() {
             else
                 echo "  $status Odoo $version: Internal only (no host port)"
             fi
+            (( version_index++ ))
         done
     fi
     
@@ -1591,44 +1593,6 @@ reset_all() {
         print_success "Reset complete"
     fi
 }
-
-case "$1" in
-    start) start_services $2 ;;
-    stop) stop_services $2 ;;
-    restart)
-        stop_services $2
-        sleep 2
-        start_services $2 ;;
-    logs)
-        if [ -z "$2" ]; then
-            docker compose logs -f
-        else
-            validate_version "$2"
-            docker compose logs -f odoo$2
-        fi ;;
-    shell)
-        if [ -z "$2" ]; then
-            print_error "Version required: $0 shell VERSION"
-            exit 1
-        fi
-        validate_version "$2"
-        docker compose exec odoo$2 /bin/bash ;;
-    config) edit_config $2 ;;
-    urls) show_urls ;;
-    update) update_modules $2 ;;
-    scaffold) scaffold_module $2 $3 ;;
-    clean) clean_all ;;
-    reset) reset_all ;;
-    performance) run_performance_analysis ;;
-    production) switch_to_production $2 ;;
-    development) switch_to_development $2 ;;
-    debug) enable_debug_mode $2 ;;
-    monitor) monitor_resources $2 ;;
-    backup) backup_database $2 ;;
-    restore) restore_database $2 $3 $4 ;;
-    init) run_initialization ;;
-    *) show_usage ;;
-esac
 
 run_performance_analysis() {
     if [ -f "conf/performance-tuner.sh" ]; then
@@ -1724,12 +1688,12 @@ monitor_resources() {
 
     if [ -z "$version" ]; then
         print_info "Overall system resources:"
-        docker stats --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}"
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}"
     else
         validate_version "$version"
         print_info "Resources for Odoo $version:"
-        docker stats --no-stream "${PROJECT_NAME}-odoo${version}-1" "${PROJECT_NAME}-db-1" 2>/dev/null || \
-        docker stats --no-stream "${PROJECT_NAME}_odoo${version}_1" "${PROJECT_NAME}_db_1" 2>/dev/null || \
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" "${PROJECT_NAME}-odoo${version}-1" "${PROJECT_NAME}-db-1" 2>/dev/null || \
+        docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}" "${PROJECT_NAME}_odoo${version}_1" "${PROJECT_NAME}_db_1" 2>/dev/null || \
         print_error "Containers not running or not found"
     fi
 }
@@ -1768,7 +1732,7 @@ backup_database() {
                 break
             fi
         done
-    }
+    fi
 
     # Backup filestore (attachments, documents, etc.)
     docker compose exec -T odoo$version tar -czf - -C /var/lib/odoo/filestore . > "$filestore_backup" 2>/dev/null || {
@@ -1845,6 +1809,44 @@ run_initialization() {
         exit 1
     fi
 }
+
+case "$1" in
+    start) start_services $2 ;;
+    stop) stop_services $2 ;;
+    restart)
+        stop_services $2
+        sleep 2
+        start_services $2 ;;
+    logs)
+        if [ -z "$2" ]; then
+            docker compose logs -f
+        else
+            validate_version "$2"
+            docker compose logs -f odoo$2
+        fi ;;
+    shell)
+        if [ -z "$2" ]; then
+            print_error "Version required: $0 shell VERSION"
+            exit 1
+        fi
+        validate_version "$2"
+        docker compose exec odoo$2 /bin/bash ;;
+    config) edit_config $2 ;;
+    urls) show_urls ;;
+    update) update_modules $2 ;;
+    scaffold) scaffold_module $2 $3 ;;
+    clean) clean_all ;;
+    reset) reset_all ;;
+    performance) run_performance_analysis ;;
+    production) switch_to_production $2 ;;
+    development) switch_to_development $2 ;;
+    debug) enable_debug_mode $2 ;;
+    monitor) monitor_resources $2 ;;
+    backup) backup_database $2 ;;
+    restore) restore_database $2 $3 $4 ;;
+    init) run_initialization ;;
+    *) show_usage ;;
+esac
 SCRIPT_EOF
 
 # Replace placeholder
