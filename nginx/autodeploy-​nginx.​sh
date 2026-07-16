@@ -20,6 +20,7 @@
 # License: MIT
 
 set -e
+set -o pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -70,7 +71,9 @@ check_port() {
         nc -z localhost "$port" &> /dev/null
         return $?
     elif command -v netstat &> /dev/null; then
-        netstat -tuln | grep -q ":$port "
+        # No -q: grep must consume the full stream, otherwise netstat gets
+        # SIGPIPE and pipefail turns a found port into a false negative
+        netstat -tuln | grep ":$port " > /dev/null
         return $?
     else
         # Fallback to a basic check
@@ -114,6 +117,20 @@ if [[ -z "$ADMIN_PASSWD" ]]; then
     ADMIN_PASSWD=$(openssl rand -base64 32)
     print_warning "Generated random password: ${ADMIN_PASSWD}"
     print_warning "Save this password securely!"
+fi
+
+# Python requirements strategy
+print_header "Python Requirements Strategy"
+echo "1) Install at container start (flexible: edit requirements.txt + restart)"
+echo "2) Bake custom image (faster restarts, no internet needed at runtime,"
+echo "   update via './manage.sh rebuild' - same feel as 'docker compose pull')"
+print_input "Select option [1]:"
+read -r BAKE_CHOICE
+BAKE_IMAGE=$([[ "$BAKE_CHOICE" == "2" ]] && echo "true" || echo "false")
+if [[ "$BAKE_IMAGE" == "true" ]]; then
+    print_success "Baking custom images - edit {VERSION}-build/requirements.txt then './manage.sh rebuild VERSION'"
+else
+    print_success "Installing requirements at container start - edit {VERSION}-config/requirements.txt then restart"
 fi
 
 # Nginx option - ASK FIRST
@@ -217,14 +234,38 @@ for version in "${VALID_VERSIONS[@]}"; do
     fi
 done
 
-# Determine PostgreSQL version based on Odoo versions
-PG_VERSION="17"
+# Determine recommended PostgreSQL version based on Odoo versions
+PG_VERSION_DEFAULT="17"
 for version in "${VALID_VERSIONS[@]}"; do
     if [ "$version" -ge 19 ]; then
-        PG_VERSION="18"
+        PG_VERSION_DEFAULT="18"
         break
     fi
 done
+
+# Let the deployer pick (e.g. matching an existing production DB for a sandbox clone)
+print_input "PostgreSQL version [${PG_VERSION_DEFAULT}]:"
+read -r PG_VERSION
+[[ -z "$PG_VERSION" ]] && PG_VERSION=$PG_VERSION_DEFAULT
+
+if ! [[ "$PG_VERSION" =~ ^[0-9]+$ ]] || [ "$PG_VERSION" -lt 13 ]; then
+    print_error "PostgreSQL version must be a number >= 13 (Odoo 16+ requires PG 13+)"
+    exit 1
+fi
+
+if [ "$PG_VERSION" != "$PG_VERSION_DEFAULT" ]; then
+    print_warning "Using PostgreSQL ${PG_VERSION} (recommended for your Odoo versions: ${PG_VERSION_DEFAULT})"
+fi
+
+# The postgres:18+ image moved its volume to /var/lib/postgresql; the old
+# /var/lib/postgresql/data layout leaves a stray anonymous volume there.
+if [ "$PG_VERSION" -ge 18 ]; then
+    PG_VOLUME_MOUNT="db-data:/var/lib/postgresql:Z"
+    PG_DATA_ENV=""
+else
+    PG_VOLUME_MOUNT="db-data:/var/lib/postgresql/data:Z"
+    PG_DATA_ENV="PGDATA: /var/lib/postgresql/data/pgdata"
+fi
 
 # Generate docker-compose.yml with custom entrypoint
 print_status "Generating docker-compose.yml with custom entrypoint..."
@@ -238,11 +279,24 @@ services:
       POSTGRES_USER: odoo
       POSTGRES_PASSWORD: odoo
       POSTGRES_DB: postgres
-      PGDATA: /var/lib/postgresql/data/pgdata
       TZ: Africa/Nairobi
+EOF
+
+if [ -n "$PG_DATA_ENV" ]; then
+    echo "      ${PG_DATA_ENV}" >> docker-compose.yml
+fi
+
+cat >> docker-compose.yml << EOF
     volumes:
-      - db-data:/var/lib/postgresql/data:Z
+      - ${PG_VOLUME_MOUNT}
       - ./conf/postgresql:/etc/postgresql:ro
+    # Load the generated tuning config - without this postgres silently runs
+    # with defaults (128MB shared_buffers) and the mounted files do nothing
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    shm_size: "256mb"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U odoo"]
       interval: 10s
@@ -274,13 +328,22 @@ fi
 
 # Generate services for each version
 for version in "${VALID_VERSIONS[@]}"; do
+    # Image source: official image, or locally baked image with requirements
+    if [[ "$BAKE_IMAGE" == "true" ]]; then
+        IMAGE_BLOCK="build:
+      context: ./${version}-build
+    image: ${PROJECT_NAME}-odoo${version}:latest"
+    else
+        IMAGE_BLOCK="image: odoo:${version}.0"
+    fi
+
     if [[ "$USE_NGINX" == "true" ]]; then
         # With Nginx: no host port mapping, only internal container ports
         print_status "Odoo ${version} will be accessible via Nginx (internal ports only)"
         
         cat >> docker-compose.yml << EOF
   odoo${version}:
-    image: odoo:${version}.0
+    ${IMAGE_BLOCK}
     restart: unless-stopped
     depends_on:
       db:
@@ -340,7 +403,7 @@ EOF
 
         cat >> docker-compose.yml << EOF
   odoo${version}:
-    image: odoo:${version}.0
+    ${IMAGE_BLOCK}
     restart: unless-stopped
     depends_on:
       db:
@@ -410,6 +473,12 @@ cat > conf/postgresql/postgresql.conf << EOF
 # System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM
 
 # Connection Settings
+# listen_addresses MUST be '*' here: this file replaces the image-generated
+# config (which the docker image patches to listen on all interfaces).
+# Without it postgres only listens on loopback and Odoo gets
+# "Connection refused" while the socket-based healthcheck stays green.
+listen_addresses = '*'
+port = 5432
 max_connections = 200
 superuser_reserved_connections = 3
 
@@ -506,9 +575,10 @@ for version in "${VALID_VERSIONS[@]}"; do
 
     print_status "Creating auto-configured Odoo ${version}..."
 
-    # Calculate workers based on system resources
-    MEMORY_SAFETY_FACTOR=0.8
-    available_ram_mb=$(echo "$TOTAL_RAM_MB * $MEMORY_SAFETY_FACTOR" | bc | cut -d. -f1)
+    # Calculate workers based on system resources.
+    # Pure bash arithmetic (80% safety factor) - bc is not installed on
+    # minimal server images and its silent failure used to force workers=0.
+    available_ram_mb=$(( TOTAL_RAM_MB * 80 / 100 ))
     
     # Reserve 1GB for OS and DB
     RESERVED_RAM=1024
@@ -540,7 +610,8 @@ for version in "${VALID_VERSIONS[@]}"; do
     fi
 
     DEV_WORKERS=$OPTIMAL_WORKERS
-    
+    PROD_WORKERS=$OPTIMAL_WORKERS
+
     # Calculate bytes for Odoo config
     HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
     SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
@@ -635,20 +706,22 @@ ENTRYPOINT_EOF
     # Add version-specific pip handling
     if [ "$version" -ge 18 ]; then
         cat >> "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
-    pip3 install --break-system-packages -r /etc/odoo/requirements.txt
+    pip3 install --break-system-packages -r /etc/odoo/requirements.txt || echo "WARNING: pip install failed, continuing with existing packages"
 ENTRYPOINT_EOF
     else
         cat >> "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
-    pip3 install -r /etc/odoo/requirements.txt
+    pip3 install -r /etc/odoo/requirements.txt || echo "WARNING: pip install failed, continuing with existing packages"
 ENTRYPOINT_EOF
     fi
 
     cat >> "${version}-config/entrypoint.sh" << 'ENTRYPOINT_EOF'
 fi
 
-# Set proper permissions
-chown -R odoo:odoo /var/lib/odoo
-chown -R odoo:odoo /var/log/odoo
+# Fix permissions where possible. This entrypoint runs as the unprivileged
+# "odoo" user (official image drops root), so chown on root-owned bind mounts
+# is expected to fail - it must never abort startup.
+chown -R odoo:odoo /var/lib/odoo 2>/dev/null || true
+chown -R odoo:odoo /var/log/odoo 2>/dev/null || true
 
 # Function to check database connectivity
 wait_for_db() {
@@ -682,6 +755,13 @@ check_config "db_port" "$PORT"
 check_config "db_user" "$USER"
 check_config "db_password" "$PASSWORD"
 
+# If the mounted log directory is not writable by the odoo user, override the
+# configured logfile so Odoo logs to stdout instead of crashing on startup.
+if [ ! -w /var/log/odoo ]; then
+    echo "WARNING: /var/log/odoo is not writable - logging to stdout instead"
+    DB_ARGS+=("--logfile=")
+fi
+
 case "$1" in
     -- | odoo)
         shift
@@ -706,8 +786,19 @@ ENTRYPOINT_EOF
     # Make entrypoint executable
     chmod +x "${version}-config/entrypoint.sh"
 
-    # Create requirements.txt for additional packages
-    cat > "${version}-config/requirements.txt" << EOF
+    # Create requirements.txt for additional packages.
+    # Bake mode: lives in the build context and gets baked into the image
+    #   (the entrypoint pip step auto-skips since /etc/odoo/requirements.txt
+    #   won't exist). Update flow: edit + './manage.sh rebuild VERSION'.
+    # Runtime mode: lives in {VERSION}-config and installs at container start.
+    if [[ "$BAKE_IMAGE" == "true" ]]; then
+        REQUIREMENTS_FILE="${version}-build/requirements.txt"
+        mkdir -p "${version}-build"
+    else
+        REQUIREMENTS_FILE="${version}-config/requirements.txt"
+    fi
+
+    cat > "$REQUIREMENTS_FILE" << EOF
 # Additional Python packages for Odoo ${version}
 requests>=2.25.0
 python-dateutil>=2.8.0
@@ -719,6 +810,26 @@ xlrd>=1.2.0
 gevent>=21.0.0
 psycopg2-binary>=2.8.6
 EOF
+
+    # Create Dockerfile for baked image mode
+    if [[ "$BAKE_IMAGE" == "true" ]]; then
+        if [ "$version" -ge 18 ]; then
+            PIP_FLAGS="--break-system-packages"
+        else
+            PIP_FLAGS=""
+        fi
+        cat > "${version}-build/Dockerfile" << EOF
+FROM odoo:${version}.0
+
+# Python requirements baked in at build time.
+# Add packages to requirements.txt, then: ./manage.sh rebuild ${version}
+COPY requirements.txt /tmp/requirements.txt
+USER root
+RUN pip3 install ${PIP_FLAGS} --no-cache-dir -r /tmp/requirements.txt \\
+    && rm /tmp/requirements.txt
+USER odoo
+EOF
+    fi
 
     # Create log directory
     mkdir -p "${version}-logs" 2>/dev/null || true
@@ -800,11 +911,18 @@ for version in VERSIONS_PLACEHOLDER; do
     fi
 done
 
-    # Initialize Odoo databases
+# Initialize Odoo databases
 for version in VERSIONS_PLACEHOLDER; do
     db_name="PROJECT_NAME_${version}"
     print_info "Initializing Odoo $version database..."
-    docker compose exec odoo$version odoo --config=/etc/odoo/odoo.conf -d "$db_name" -i base --stop-after-init --without-demo=all
+    # Odoo 18+ creates databases without demo data by default;
+    # --without-demo=all is deprecated there and only needed for <= 17
+    if [ "$version" -ge 18 ]; then
+        demo_flag=""
+    else
+        demo_flag="--without-demo=all"
+    fi
+    docker compose exec odoo$version odoo --config=/etc/odoo/odoo.conf -d "$db_name" -i base --stop-after-init $demo_flag
     print_success "Odoo $version initialized"
 done
 
@@ -1419,10 +1537,35 @@ show_usage() {
     echo "  debug VERSION       Enable single-threaded debug mode"
     echo "  monitor [VERSION]   Show resource usage"
     echo "  backup [VERSION]    Backup database and filestore"
-    echo "  restore DB_FILE VERSION [FILESTORE_FILE] Restore database and filestore"
+    echo "  restore FILE VERSION [FILESTORE_FILE]"
+    echo "                      Restore from .sql, .sql.gz or Odoo manager .zip"
+    echo "                      (.zip includes the filestore automatically)"
+    echo "  rebuild [VERSION]   Update images: rebuilds baked images with --pull,"
+    echo "                      or pulls latest official images, then restarts"
     echo "  init                Auto-initialize databases (first run)"
     echo
     echo "Available versions: ${AVAILABLE_VERSIONS[*]}"
+}
+
+rebuild_images() {
+    local version=$1
+    local services=()
+    if [ -n "$version" ]; then
+        validate_version "$version"
+        services=("odoo$version")
+    fi
+
+    if grep -q "    build:" docker-compose.yml 2>/dev/null; then
+        print_info "Rebuilding baked image(s) with latest base + requirements..."
+        docker compose build --pull "${services[@]}"
+    else
+        print_info "Pulling latest official image(s)..."
+        docker compose pull "${services[@]}"
+    fi
+
+    print_info "Restarting with updated image(s)..."
+    docker compose up -d "${services[@]}"
+    print_success "Images updated and services restarted"
 }
 
 validate_version() {
@@ -1481,7 +1624,7 @@ show_urls() {
                 status="[STOPPED]"
             fi
             
-            echo "  $status Odoo $version: http://odoo${version}.${base_domain}:${nginx_port} (admin/admin123)"
+            echo "  $status Odoo $version: http://odoo${version}.${base_domain}:${nginx_port}"
         done
         echo ""
         if [[ "$base_domain" == "127-0-0-1.sslip.io" ]]; then
@@ -1507,7 +1650,7 @@ show_urls() {
             fi
             
             if [[ "$host_port" != "N/A" ]]; then
-                echo "  $status Odoo $version: http://localhost:$host_port (admin/admin123)"
+                echo "  $status Odoo $version: http://localhost:$host_port"
                 echo "     └─ Longpolling: http://localhost:$host_longpoll_port"
             else
                 echo "  $status Odoo $version: Internal only (no host port)"
@@ -1517,7 +1660,9 @@ show_urls() {
     fi
     
     echo ""
-    echo "    PostgreSQL: localhost:5432 (user: odoo, pass: odoo)"
+    echo "    PostgreSQL: internal only (service 'db', user: odoo, pass: odoo)"
+    echo "    Master password (DB manager): see <version>-config/odoo.conf (admin_passwd)"
+    echo "    First login: create a database via the web UI - you set the admin user there"
     echo
 }
 
@@ -1751,7 +1896,9 @@ restore_database() {
     local filestore_file=$3
 
     if [ -z "$backup_file" ] || [ -z "$version" ]; then
-        print_error "Usage: $0 restore DATABASE_BACKUP.sql VERSION [FILESTORE_BACKUP.tar.gz]"
+        print_error "Usage: $0 restore BACKUP_FILE VERSION [FILESTORE_BACKUP.tar.gz]"
+        print_error "  BACKUP_FILE: .sql, .sql.gz, or .zip (Odoo database manager backup"
+        print_error "  with dump.sql + filestore - filestore restored automatically)"
         exit 1
     fi
 
@@ -1771,6 +1918,23 @@ restore_database() {
         exit 0
     fi
 
+    # Odoo database manager zip: contains dump.sql (+ optional filestore/)
+    local zip_tmp_dir=""
+    if [[ "$backup_file" == *.zip ]]; then
+        if ! command -v unzip > /dev/null 2>&1; then
+            print_error "unzip is required to restore .zip backups (apt install unzip)"
+            exit 1
+        fi
+        zip_tmp_dir=$(mktemp -d)
+        print_info "Extracting Odoo backup zip..."
+        unzip -q "$backup_file" -d "$zip_tmp_dir"
+        if [ ! -f "$zip_tmp_dir/dump.sql" ]; then
+            print_error "Invalid Odoo backup zip: dump.sql not found inside"
+            rm -rf "$zip_tmp_dir"
+            exit 1
+        fi
+    fi
+
     print_info "Stopping Odoo $version..."
     docker compose stop odoo$version
 
@@ -1780,19 +1944,34 @@ restore_database() {
     docker compose exec -T db psql -U odoo -c "DROP DATABASE IF EXISTS $db_name;"
     docker compose exec -T db psql -U odoo -c "CREATE DATABASE $db_name OWNER odoo;"
 
-    # Restore from backup (handling compression)
-    if [[ "$backup_file" == *.gz ]]; then
+    # Restore from backup (handling format)
+    if [ -n "$zip_tmp_dir" ]; then
+        docker compose exec -T db psql -U odoo -d "$db_name" < "$zip_tmp_dir/dump.sql"
+    elif [[ "$backup_file" == *.gz ]]; then
         gunzip -c "$backup_file" | docker compose exec -T db psql -U odoo -d "$db_name"
     else
         docker compose exec -T db psql -U odoo -d "$db_name" < "$backup_file"
     fi
 
-    # Restore filestore if provided
-    if [ -n "$filestore_file" ] && [ -f "$filestore_file" ]; then
-        print_info "Restoring filestore from $filestore_file..."
-        docker compose exec -T odoo$version sh -c "rm -rf /var/lib/odoo/filestore/* && tar -xzf - -C /var/lib/odoo/filestore" < "$filestore_file"
+    # Restore filestore bundled in the zip (goes to filestore/<db_name>)
+    if [ -n "$zip_tmp_dir" ] && [ -d "$zip_tmp_dir/filestore" ]; then
+        print_info "Restoring filestore from zip..."
+        docker compose run --rm -T --entrypoint sh odoo$version -c \
+            "rm -rf /var/lib/odoo/filestore/$db_name && mkdir -p /var/lib/odoo/filestore/$db_name && tar -xf - -C /var/lib/odoo/filestore/$db_name" \
+            < <(tar -C "$zip_tmp_dir/filestore" -cf - .)
         print_success "Filestore restored"
     fi
+
+    # Restore separately-provided filestore archive (full filestore tree)
+    if [ -n "$filestore_file" ] && [ -f "$filestore_file" ]; then
+        print_info "Restoring filestore from $filestore_file..."
+        docker compose run --rm -T --entrypoint sh odoo$version -c \
+            "rm -rf /var/lib/odoo/filestore/* && tar -xzf - -C /var/lib/odoo/filestore" \
+            < "$filestore_file"
+        print_success "Filestore restored"
+    fi
+
+    [ -n "$zip_tmp_dir" ] && rm -rf "$zip_tmp_dir"
 
     print_info "Starting Odoo $version..."
     docker compose start odoo$version
@@ -1844,6 +2023,7 @@ case "$1" in
     monitor) monitor_resources $2 ;;
     backup) backup_database $2 ;;
     restore) restore_database $2 $3 $4 ;;
+    rebuild) rebuild_images $2 ;;
     init) run_initialization ;;
     *) show_usage ;;
 esac
@@ -1871,7 +2051,7 @@ if [[ "$USE_NGINX" == "true" ]]; then
     echo "**Nginx Reverse Proxy (Host-Based Routing)**" >> README.md
     echo "" >> README.md
     for version in "${VALID_VERSIONS[@]}"; do
-        echo "- **Odoo ${version}**: http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT} (admin/admin123)" >> README.md
+        echo "- **Odoo ${version}**: http://odoo${version}.${BASE_DOMAIN}:${NGINX_PORT}" >> README.md
     done
     echo "" >> README.md
     if [[ "$BASE_DOMAIN" == "127-0-0-1.sslip.io" ]]; then
@@ -1899,16 +2079,31 @@ else
     for version in "${VALID_VERSIONS[@]}"; do
         host_port=$((BASE_PORT + version - 16))
         host_longpoll_port=$((host_port + 1000))
-        echo "- **Odoo ${version}**: http://localhost:${host_port} (admin/admin123)" >> README.md
+        echo "- **Odoo ${version}**: http://localhost:${host_port}" >> README.md
         echo "  - Longpolling: http://localhost:${host_longpoll_port}" >> README.md
     done
 fi
 
 echo "" >> README.md
 
+# Docs strings depending on requirements strategy
+if [[ "$BAKE_IMAGE" == "true" ]]; then
+    REQ_DOC_PATH="{VERSION}-build/requirements.txt"
+    REQ_DOC_HINT="baked into image, apply with ./manage.sh rebuild VERSION"
+    REBUILD_DOC_HINT="rebuilds baked images with latest base + requirements"
+else
+    REQ_DOC_PATH="{VERSION}-config/requirements.txt"
+    REQ_DOC_HINT="installed at container start, apply with ./manage.sh restart VERSION"
+    REBUILD_DOC_HINT="pulls latest official images and restarts"
+fi
+
 cat >> README.md << EOF
 **Database:**
-- **PostgreSQL**: localhost:5432 (odoo/odoo)
+- **PostgreSQL**: internal only, service \`db\` (odoo/odoo)
+
+**Credentials:**
+- Master password (database manager): \`admin_passwd\` in \`{VERSION}-config/odoo.conf\`
+- Odoo admin user: created by YOU when you create a database via the web UI
 
 ## Configuration Features
 - ✅ **Custom entrypoints** for proper config loading
@@ -1941,8 +2136,14 @@ cp -r /path/to/my_module ./17-addons/custom/
 Each version has its own complete config:
 - \`{VERSION}-config/odoo.conf\` - Main configuration
 - \`{VERSION}-config/entrypoint.sh\` - Custom entrypoint
-- \`{VERSION}-config/requirements.txt\` - Python packages
+- \`${REQ_DOC_PATH}\` - Python packages (${REQ_DOC_HINT})
 - \`{VERSION}-config/logrotate\` - Log rotation
+
+## Updating Images
+\`\`\`bash
+./manage.sh rebuild      # All versions: ${REBUILD_DOC_HINT}
+./manage.sh rebuild 17   # Single version
+\`\`\`
 
 ## Debugging
 \`\`\`bash
@@ -1986,7 +2187,13 @@ echo "  - Custom entrypoints with proper config loading"
 echo "  - PostgreSQL ${PG_VERSION} optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
 echo "  - Odoo workers: ${DEV_WORKERS} (development) / ${PROD_WORKERS} (production)"
 echo "  - SELinux-compatible volume mounts"
-echo "  - Python requirements.txt support"
+if [[ "$BAKE_IMAGE" == "true" ]]; then
+    echo "  - Python requirements baked into custom images ({VERSION}-build/)"
+    echo "    Update: edit requirements.txt, then './manage.sh rebuild VERSION'"
+else
+    echo "  - Python requirements installed at container start ({VERSION}-config/)"
+    echo "    Update: edit requirements.txt, then './manage.sh restart VERSION'"
+fi
 if [[ "$USE_NGINX" == "true" ]]; then
     echo "  - Nginx reverse proxy on port ${NGINX_PORT}"
     echo
