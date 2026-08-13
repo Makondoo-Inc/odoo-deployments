@@ -35,7 +35,9 @@
 ```mermaid
 graph TD
     A[Host Machine] --> B[Docker Compose]
-    B --> C[PostgreSQL 17<br/>Auto-tuned]
+    B --> C[PostgreSQL 18<br/>Auto-tuned]
+    B -->|Optional| P[PgBouncer<br/>Transaction pooling]
+    P --> C
     B --> D[Odoo Instances]
     D --> D1[Odoo 16:8069]
     D --> D2[Odoo 17:8069]
@@ -59,7 +61,7 @@ graph TD
 ### Architecture Highlights
 
 - **Container Isolation**: Each Odoo version runs in its own container
-- **Shared Database**: Single PostgreSQL 17 instance serves all versions
+- **Shared Database**: Single PostgreSQL 18 instance serves all versions (older PG selectable at deploy time)
 - **Persistent Storage**: Docker named volumes for data persistence
 - **Optional Proxy**: Nginx provides clean URLs and SSL termination
 - **Auto-Configuration**: System resources detected and optimized automatically
@@ -96,11 +98,24 @@ Manual Odoo deployments are time-consuming and error-prone. This script eliminat
 - Automatic port conflict detection and resolution
 
 ### Database & Performance
-- PostgreSQL 17 with auto-tuned configuration
-- Resource-aware worker calculation (CPU + RAM analysis)
-- Consistent 2GB memory allocation per worker
-- Connection pooling and autovacuum optimization
-- Query performance logging and monitoring
+- PostgreSQL 18 (default) with auto-tuned configuration, including the PG18
+  asynchronous I/O subsystem (`io_method=worker`, `io_workers` scaled to CPU)
+- Resource-aware worker calculation (CPU + RAM analysis, divided across
+  deployed versions) - no artificial worker cap, scales from 2 to 256+ cores
+- Connection budget computed end-to-end: `max_connections` and `db_maxconn`
+  derive from the worker count instead of flat literals
+- RAM-tiered worker memory limits (512MB/1GB/2GB by machine size)
+- WAL/checkpoint sizing, autovacuum workers, and container `shm_size` scaled
+  to the hardware
+- Parallel query scaled to cores (`max_parallel_workers`,
+  `max_parallel_workers_per_gather`) so single huge reports fan out instead of
+  being capped at Postgres's default of 2 workers
+- Optional PgBouncer (transaction pooling) fully decouples Odoo worker count
+  from `max_connections`; Odoo's websocket bus (LISTEN/NOTIFY on the
+  `postgres` DB) is automatically routed in session mode so realtime features
+  keep working
+- Built-in observability: `pg_stat_statements` preloaded, `track_io_timing`
+  on - verify the tuning with real numbers
 
 ### Nginx Reverse Proxy (Optional)
 - Host-based routing with subdomains
@@ -496,15 +511,23 @@ session_cookie_secure = True
 
 ### Auto-Tuned PostgreSQL Settings
 
-Based on detected system resources:
+Based on detected system resources (CPU, RAM, number of deployed versions):
 
 ```ini
-# Example for 4-core, 8GB system
-shared_buffers = 2048MB            # 25% of RAM
+# Example for 4-core, 8GB system, 1 version
+shared_buffers = 2048MB            # 25% of RAM (capped at 16GB + huge_pages=try)
 effective_cache_size = 6144MB      # 75% of RAM
-maintenance_work_mem = 512MB       # ~6% of RAM
-work_mem = 128MB                   # RAM / (cores * 4)
-max_connections = 200
+maintenance_work_mem = 512MB       # ~6% of RAM (capped at 4GB)
+work_mem = 61MB                    # (RAM - shared_buffers) / max_connections
+max_connections = 100              # from worker count x versions + headroom
+max_wal_size = 4GB                 # RAM-tiered, spreads checkpoints out
+autovacuum_max_workers = 3         # scales with cores (3..8)
+shared_preload_libraries = 'pg_stat_statements'
+track_io_timing = on
+
+# PostgreSQL 18+ additionally gets async I/O:
+io_method = worker
+io_workers = 3                     # ~1/4 of CPU threads (3..32)
 ```
 
 ---
@@ -578,25 +601,27 @@ cd your-project
 ./conf/performance-tuner.sh
 ```
 
+The analyzer runs the exact same formula the deploy script used, against
+current hardware, and flags any drift (e.g. after a RAM upgrade).
+
 **Output example:**
 ```
 System Resources Detected:
-  CPU Cores: 4
-  Total RAM: 8GB (8192MB)
+  CPU Cores: 8
+  Total RAM: 31824MB
+  Odoo versions sharing host: 2
 
-Worker Recommendations:
-  Conservative: 5 workers (CPU + 1)
-  Optimal: 9 workers (CPU * 2 + 1)
-
-Memory Requirements:
-  Per worker: 2048MB
-  Conservative setup: 10240MB
-  Optimal setup: 18432MB
-  Available: 8192MB
-
-Recommended Configuration:
+Recommended per version (deploy-time formula):
+  RAM limited:  5 workers
+  CPU limited:  9 workers
   workers = 5
-  limit_memory_hard = 2147483648  # 2GB
+  db_maxconn = 64
+  limit_memory_hard = 2147483648  # 2048MB
+  limit_memory_soft = 1677721600  # 1600MB
+  (postgres max_connections should be 100)
+
+[SUCCESS] 17-config/odoo.conf: matches current hardware recommendation
+[SUCCESS] 18-config/odoo.conf: matches current hardware recommendation
 ```
 
 ### Manual Tuning
@@ -606,33 +631,45 @@ Edit configuration:
 ./manage.sh config 17
 ```
 
-**Critical parameters:**
+**Critical parameters (auto-computed at deploy time):**
 
-| Parameter | Development | Production | Description |
-|-----------|-------------|------------|-------------|
-| `workers` | 0 or CPU+1 | (CPU*2)+1 | 0 = single-threaded with hot-reload |
-| `limit_memory_hard` | 2147483648 | 2147483648 | 2GB hard limit per worker |
-| `limit_memory_soft` | 1825361100 | 1825361100 | 1.7GB soft limit |
-| `db_maxconn` | 64 | 64 | Max DB connections per worker |
-| `proxy_mode` | False | True | Enable if behind Nginx/proxy |
-| `list_db` | True | False | Hide database list in production |
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `workers` | auto | min(RAM budget / soft limit, (CPU*2+1) / versions); 0 = single-threaded with hot-reload |
+| `limit_memory_hard` | RAM-tiered | 512MB / 1GB / 2GB per worker by machine size |
+| `limit_memory_soft` | RAM-tiered | 400MB / 800MB / 1600MB; steady-state footprint |
+| `db_maxconn` | auto | workers*2 + 16, clamped to 64..256 (per-process pool cap) |
+| `proxy_mode` | False/True | Enable if behind Nginx/proxy |
+| `list_db` | True/False | Hide database list in production |
 
 ### Resource Calculations
 
-**Worker formula:**
+One formula drives the whole stack (deploy script and performance tuner):
+
 ```
-Development: CPU_CORES + 1
-Production: (CPU_CORES * 2) + 1
+worker RAM budget  = RAM * 80% - 512MB (OS) - shared_buffers
+workers/version    = min( budget / versions / soft_limit , ceil((CPU*2+1) / versions) )
+
+# without PgBouncer:
+max_connections    = (workers*2 + cron + gevent allowance) * versions * 1.2 + 10
+                     (clamped to 100..1000 - past 1000, workers shrink to fit)
+
+# with PgBouncer (transaction pooling):
+max_connections    = CPU*4 + 20 (100..500) - workers unlimited by connections
+pool per database  = CPU*2 (8..64)
+
+work_mem           = (RAM - shared_buffers) / max_connections   (4..256MB)
 ```
 
-**Memory formula:**
-```
-Required RAM = (workers * 2048MB) + 1024MB (system)
-```
+Workers are planned at the soft limit because Odoo recycles any worker that
+exceeds it - the hard limit only guards abnormal spikes. There is no fixed
+worker cap: a 256-core machine gets hundreds of workers, bounded only by the
+RAM budget (and, without PgBouncer, the connection budget).
 
-**Example for 4-core system:**
-- Conservative: 5 workers = 11264MB RAM required
-- Optimal: 9 workers = 19456MB RAM required
+**PgBouncer and the Odoo bus:** transaction pooling breaks `LISTEN`/`NOTIFY`.
+Odoo's realtime bus does both on the `postgres` maintenance database (see
+`addons/bus/models/bus.py`), so the generated `pgbouncer.ini` pins that one
+database to session mode while everything else is transaction-pooled.
 
 ---
 

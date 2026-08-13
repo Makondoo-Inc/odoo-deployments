@@ -9,7 +9,7 @@
 # - Multi-version Odoo deployment (16, 17, 18, 19)
 # - Optional Nginx reverse proxy with host-based routing
 # - Wildcard DNS support (sslip.io) - no /etc/hosts editing required
-# - Auto-configured PostgreSQL 17 with performance tuning
+# - Auto-configured PostgreSQL 18 (default) with performance tuning + async I/O
 # - Docker Compose orchestration
 # - SELinux-compatible volume mounts
 # - Custom entrypoints with proper configuration loading
@@ -38,8 +38,8 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 print_input() { echo -e "${BLUE}[INPUT]${NC} $1"; }
 
-# Welcome
-clear
+# Welcome (clear fails on dumb/absent TERM, e.g. when piped - never fatal)
+clear 2>/dev/null || true
 echo -e "${CYAN}Odoo Multi-Version Deployment Script${NC}"
 echo -e "${CYAN}Production-ready with optional Nginx reverse proxy${NC}"
 echo
@@ -234,14 +234,11 @@ for version in "${VALID_VERSIONS[@]}"; do
     fi
 done
 
-# Determine recommended PostgreSQL version based on Odoo versions
-PG_VERSION_DEFAULT="17"
-for version in "${VALID_VERSIONS[@]}"; do
-    if [ "$version" -ge 19 ]; then
-        PG_VERSION_DEFAULT="18"
-        break
-    fi
-done
+# Default to PostgreSQL 18 for all Odoo versions: PG18 is compatibility-safe
+# for Odoo's ORM-generated SQL and brings the async-I/O subsystem (io_method/
+# io_workers) plus pg_stat_io byte-level stats. Older PG remains an explicit
+# opt-down at the prompt below (e.g. to match an existing production DB).
+PG_VERSION_DEFAULT="18"
 
 # Let the deployer pick (e.g. matching an existing production DB for a sandbox clone)
 print_input "PostgreSQL version [${PG_VERSION_DEFAULT}]:"
@@ -257,6 +254,22 @@ if [ "$PG_VERSION" != "$PG_VERSION_DEFAULT" ]; then
     print_warning "Using PostgreSQL ${PG_VERSION} (recommended for your Odoo versions: ${PG_VERSION_DEFAULT})"
 fi
 
+# Optional PgBouncer connection pooler
+print_header "Connection Pooling (PgBouncer)"
+echo "PgBouncer multiplexes all Odoo connections onto a small pool of postgres"
+echo "backends. Worker counts stop being limited by max_connections entirely,"
+echo "and connection storms are absorbed by the pooler instead of postgres."
+echo "Odoo's websocket bus (LISTEN/NOTIFY on the 'postgres' DB) is routed in"
+echo "session mode automatically, so realtime chat/notifications keep working."
+print_input "Add PgBouncer connection pooler? (Y/n):"
+read -r PGB_CHOICE
+USE_PGBOUNCER=$([[ "$PGB_CHOICE" =~ ^[Nn]$ ]] && echo "false" || echo "true")
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    print_success "PgBouncer enabled - transaction pooling with session-mode bus routing"
+else
+    print_status "No pooler - Odoo connects to postgres directly (worker count stays connection-budgeted)"
+fi
+
 # The postgres:18+ image moved its volume to /var/lib/postgresql; the old
 # /var/lib/postgresql/data layout leaves a stray anonymous volume there.
 if [ "$PG_VERSION" -ge 18 ]; then
@@ -266,6 +279,170 @@ else
     PG_VOLUME_MOUNT="db-data:/var/lib/postgresql/data:Z"
     PG_DATA_ENV="PGDATA: /var/lib/postgresql/data/pgdata"
 fi
+
+# ============================================================================
+# Resource detection & tuning math - SINGLE SOURCE OF TRUTH
+# Every generated config (postgresql.conf, odoo.conf, docker-compose shm_size,
+# nginx.conf, performance-tuner.sh) derives from the values computed here so
+# the whole stack scales together, from 2-core VPS to 256-core bare metal.
+# ============================================================================
+CPU_CORES=$(nproc)
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+NUM_VERSIONS=${#VALID_VERSIONS[@]}
+
+# clamp VALUE MIN MAX
+clamp() {
+    local v=$1 lo=$2 hi=$3
+    [ "$v" -lt "$lo" ] && v=$lo
+    [ "$v" -gt "$hi" ] && v=$hi
+    echo "$v"
+}
+
+# --- PostgreSQL memory -------------------------------------------------------
+SHARED_BUFFERS=$((TOTAL_RAM_MB / 4))  # 25% of RAM...
+# ...capped at 16GB: beyond that OLTP workloads like Odoo see diminishing
+# returns and double-buffering waste; the OS page cache (effective_cache_size)
+# covers the rest. huge_pages=try in postgresql.conf avoids TLB thrashing.
+[ "$SHARED_BUFFERS" -gt 16384 ] && SHARED_BUFFERS=16384
+EFFECTIVE_CACHE_SIZE=$((TOTAL_RAM_MB * 3 / 4))  # 75% of RAM
+MAINTENANCE_WORK_MEM=$(clamp $((TOTAL_RAM_MB / 16)) 64 4096)  # ~6% RAM, 4GB cap
+
+# --- Odoo workers per version ------------------------------------------------
+# Worker memory tiers by total RAM
+if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+    WORKER_MEMORY_MB=512
+    SOFT_LIMIT_MB=400
+elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+    WORKER_MEMORY_MB=1024
+    SOFT_LIMIT_MB=800
+else
+    WORKER_MEMORY_MB=2048
+    SOFT_LIMIT_MB=1600
+fi
+
+MAX_CRON_THREADS=2
+
+# RAM budget: 80% safety factor, minus a small OS reserve and what postgres
+# itself claims (shared_buffers), split evenly across deployed versions.
+# Workers are planned at their SOFT limit: that is the steady-state footprint
+# (Odoo recycles a worker that exceeds it after the current request), while
+# the hard limit only guards abnormal spikes - sizing at the hard limit would
+# leave half the machine idle.
+available_ram_mb=$(( TOTAL_RAM_MB * 80 / 100 ))
+RESERVED_RAM=$(( 512 + SHARED_BUFFERS ))
+odoo_ram_budget=$(( available_ram_mb - RESERVED_RAM ))
+[ "$odoo_ram_budget" -lt 0 ] && odoo_ram_budget=0
+per_version_ram=$(( odoo_ram_budget / NUM_VERSIONS ))
+max_workers_by_ram=$(( per_version_ram / SOFT_LIMIT_MB ))
+
+# CPU guidance (workers = cores*2+1) is for a dedicated host, so the total is
+# spread across versions (ceiling division) instead of granted to each one.
+max_workers_by_cpu=$(( (CPU_CORES * 2 + 1 + NUM_VERSIONS - 1) / NUM_VERSIONS ))
+
+OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
+# Very low resources: workers=0 runs Odoo single-process threaded mode
+[ "$OPTIMAL_WORKERS" -lt 1 ] && OPTIMAL_WORKERS=0
+
+# --- Connection budget (replaces the old flat max_connections=200 / cap of 8
+# workers, which silently throttled anything bigger than a 4-core box) -------
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    # PgBouncer (transaction mode) multiplexes any number of Odoo client
+    # connections onto a small backend pool, so workers stay bounded by
+    # CPU/RAM only. Postgres itself only needs ~4 active backends per core -
+    # more than that just queue on CPU anyway.
+    MAX_CONNECTIONS=$(clamp $(( CPU_CORES * 4 + 20 )) 100 500)
+    # Per database/user pair pool; big reports hold a backend for their whole
+    # transaction, so give each database room to fan out.
+    PGB_DEFAULT_POOL_SIZE=$(clamp $(( CPU_CORES * 2 )) 8 64)
+    # Hard per-database backend cap so one busy database cannot starve others
+    PGB_MAX_DB_CONNECTIONS=$(( MAX_CONNECTIONS - 20 ))
+    # Client side is cheap: every Odoo process may hold up to db_maxconn
+    PGB_MAX_CLIENT_CONN=$(clamp $(( NUM_VERSIONS * (OPTIMAL_WORKERS + MAX_CRON_THREADS + 2) * 16 )) 1000 10000)
+else
+    # Direct connections: peak per version is HTTP workers at ~2 connections
+    # each under load, plus cron threads, plus a gevent/bus + maintenance
+    # allowance.
+    PER_VERSION_CONNS=$(( OPTIMAL_WORKERS * 2 + MAX_CRON_THREADS + 8 ))
+    MAX_CONNECTIONS=$(( PER_VERSION_CONNS * NUM_VERSIONS * 120 / 100 + 10 ))  # +20% headroom +10 reserve
+    [ "$MAX_CONNECTIONS" -lt 100 ] && MAX_CONNECTIONS=100
+    if [ "$MAX_CONNECTIONS" -gt 1000 ]; then
+        # Past ~1000 backends, per-process overhead dominates; clamp and derive
+        # the worker count back from the budget. Enabling PgBouncer removes
+        # this limit entirely.
+        MAX_CONNECTIONS=1000
+        budget_per_version=$(( (MAX_CONNECTIONS - 10) * 100 / 120 / NUM_VERSIONS ))
+        OPTIMAL_WORKERS=$(( (budget_per_version - MAX_CRON_THREADS - 8) / 2 ))
+        print_warning "Worker count limited by 1000-connection budget - enable PgBouncer to go beyond"
+    fi
+fi
+
+# Per-process pool cap in Odoo; scaled to the computed worker count so a
+# single runaway process cannot drain the whole cluster budget.
+DB_MAXCONN=$(clamp $(( OPTIMAL_WORKERS * 2 + 16 )) 64 256)
+
+# --- work_mem: bounded against the connection budget, not just cores --------
+# Worst case is work_mem x concurrent sort/hash ops; dividing non-shared RAM
+# by max_connections keeps a fully loaded box out of OOM territory (the old
+# RAM/(cores*4) formula produced 512MB on a 2-core/4GB box).
+WORK_MEM=$(clamp $(( (TOTAL_RAM_MB - SHARED_BUFFERS) / MAX_CONNECTIONS )) 4 256)
+
+# --- WAL sizing, autovacuum, shared memory by RAM tier -----------------------
+if [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+    MAX_WAL_SIZE="2GB";  MIN_WAL_SIZE="512MB"
+elif [ "$TOTAL_RAM_MB" -lt 32768 ]; then
+    MAX_WAL_SIZE="4GB";  MIN_WAL_SIZE="1GB"
+else
+    MAX_WAL_SIZE="8GB";  MIN_WAL_SIZE="2GB"
+fi
+
+AUTOVACUUM_WORKERS=$(clamp $(( CPU_CORES / 4 )) 3 8)
+
+# --- Parallel query: what actually makes a single huge report fast ----------
+# Postgres defaults cap every query at 2 parallel workers (out of a global
+# pool of 8) no matter how many cores exist. Scale the pool to the machine so
+# big scans/sorts/aggregations fan out across cores.
+MAX_WORKER_PROCESSES=$(clamp "$CPU_CORES" 8 128)
+MAX_PARALLEL_WORKERS=$(clamp "$CPU_CORES" 8 128)
+MAX_PARALLEL_PER_GATHER=$(clamp $(( CPU_CORES / 4 )) 2 8)
+MAX_PARALLEL_MAINTENANCE=$(clamp $(( CPU_CORES / 8 )) 2 4)
+
+if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+    SHM_SIZE="256mb"
+elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+    SHM_SIZE="512mb"
+elif [ "$TOTAL_RAM_MB" -lt 32768 ]; then
+    SHM_SIZE="1gb"
+else
+    SHM_SIZE="2gb"
+fi
+
+# --- PostgreSQL 18+ async I/O -----------------------------------------------
+# io_method=worker (async I/O via worker processes) is the PG18 default but is
+# pinned explicitly, with io_workers scaled to CPU instead of the fixed 3.
+# io_uring is NOT used: Docker's default seccomp profile blocks io_uring
+# syscalls, so postgres would fail at startup inside the container.
+IO_WORKERS=$(clamp $(( CPU_CORES / 4 )) 3 32)
+
+# --- Nginx (only used when the embedded proxy is enabled) --------------------
+NGINX_WORKER_CONNECTIONS=$(clamp $(( CPU_CORES * 1024 )) 1024 8192)
+# Each proxied client costs ~2 fds (client + upstream); keep rlimit above that
+NGINX_RLIMIT_NOFILE=$(( NGINX_WORKER_CONNECTIONS * 2 + 512 ))
+NGINX_KEEPALIVE=$(clamp $(( OPTIMAL_WORKERS * 4 )) 32 128)
+NGINX_KEEPALIVE_CHAT=$(( NGINX_KEEPALIVE / 2 ))
+
+# --- Odoo memory limits (bytes) ----------------------------------------------
+HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
+SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
+
+# Where Odoo connects: through the pooler when enabled, else straight to postgres
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    ODOO_DB_HOST="pgbouncer"
+else
+    ODOO_DB_HOST="db"
+fi
+
+print_status "Detected ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} Odoo version(s)"
+print_status "Tuning: ${OPTIMAL_WORKERS} workers/version, db_maxconn=${DB_MAXCONN}, pg max_connections=${MAX_CONNECTIONS}, work_mem=${WORK_MEM}MB"
 
 # Generate docker-compose.yml with custom entrypoint
 print_status "Generating docker-compose.yml with custom entrypoint..."
@@ -289,14 +466,15 @@ fi
 cat >> docker-compose.yml << EOF
     volumes:
       - ${PG_VOLUME_MOUNT}
-      - ./conf/postgresql:/etc/postgresql:ro
+      - ./conf/postgresql:/etc/postgresql:ro,z
     # Load the generated tuning config - without this postgres silently runs
     # with defaults (128MB shared_buffers) and the mounted files do nothing
     command: >
       postgres
       -c config_file=/etc/postgresql/postgresql.conf
       -c hba_file=/etc/postgresql/pg_hba.conf
-    shm_size: "256mb"
+    # Scaled by RAM tier: parallel query DSM segments and sort spills live here
+    shm_size: "${SHM_SIZE}"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U odoo"]
       interval: 10s
@@ -304,6 +482,33 @@ cat >> docker-compose.yml << EOF
       retries: 5
 
 EOF
+
+# Add PgBouncer pooler if requested. It listens on 5432 itself so odoo.conf
+# keeps db_port unchanged; only db_host differs.
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    cat >> docker-compose.yml << EOF
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./conf/pgbouncer:/etc/pgbouncer:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U odoo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+EOF
+    # Odoo containers must additionally wait for the pooler
+    PGB_DEPENDS="
+      pgbouncer:
+        condition: service_healthy"
+else
+    PGB_DEPENDS=""
+fi
 
 # Add nginx service if requested
 if [[ "$USE_NGINX" == "true" ]]; then
@@ -314,8 +519,8 @@ if [[ "$USE_NGINX" == "true" ]]; then
     ports:
       - "${NGINX_PORT}:80"
     volumes:
-      - ./conf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./conf/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./conf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - ./conf/nginx/conf.d:/etc/nginx/conf.d:ro,z
     depends_on:
 EOF
 
@@ -347,7 +552,7 @@ for version in "${VALID_VERSIONS[@]}"; do
     restart: unless-stopped
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_healthy${PGB_DEPENDS}
     expose:
       - "8069"
       - "8072"
@@ -358,7 +563,7 @@ for version in "${VALID_VERSIONS[@]}"; do
       retries: 3
       start_period: 30s
     environment:
-      HOST: db
+      HOST: ${ODOO_DB_HOST}
       USER: odoo
       PASSWORD: odoo
       ODOO_RC: /etc/odoo/odoo.conf
@@ -407,7 +612,7 @@ EOF
     restart: unless-stopped
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_healthy${PGB_DEPENDS}
     ports:
       - "${HOST_PORT}:8069"
       - "${HOST_LONGPOLL_PORT}:8072"
@@ -418,7 +623,7 @@ EOF
       retries: 3
       start_period: 30s
     environment:
-      HOST: db
+      HOST: ${ODOO_DB_HOST}
       USER: odoo
       PASSWORD: odoo
       ODOO_RC: /etc/odoo/odoo.conf
@@ -459,18 +664,10 @@ done
 # Create PostgreSQL configuration
 mkdir -p conf/postgresql
 
-# Auto-detect system resources for PostgreSQL optimization
-CPU_CORES=$(nproc)
-TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-SHARED_BUFFERS=$((TOTAL_RAM_MB / 4))  # 25% of RAM
-EFFECTIVE_CACHE_SIZE=$((TOTAL_RAM_MB * 3 / 4))  # 75% of RAM
-MAINTENANCE_WORK_MEM=$((TOTAL_RAM_MB / 16))  # ~6% of RAM
-WORK_MEM=$((TOTAL_RAM_MB / (CPU_CORES * 4)))  # Conservative per connection
-
-# Create optimized PostgreSQL configuration
+# Create optimized PostgreSQL configuration (values from the tuning block above)
 cat > conf/postgresql/postgresql.conf << EOF
 # PostgreSQL ${PG_VERSION} Configuration - Auto-generated for Odoo
-# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM
+# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} Odoo version(s)
 
 # Connection Settings
 # listen_addresses MUST be '*' here: this file replaces the image-generated
@@ -479,28 +676,62 @@ cat > conf/postgresql/postgresql.conf << EOF
 # "Connection refused" while the socket-based healthcheck stays green.
 listen_addresses = '*'
 port = 5432
-max_connections = 200
+# Sized from the Odoo worker budget: ~(workers*2 + cron + gevent allowance)
+# per version, +20% headroom. Scales with the hardware instead of a flat 200.
+max_connections = ${MAX_CONNECTIONS}
 superuser_reserved_connections = 3
 
 # Memory Settings
 shared_buffers = ${SHARED_BUFFERS}MB
+huge_pages = try
 effective_cache_size = ${EFFECTIVE_CACHE_SIZE}MB
 maintenance_work_mem = ${MAINTENANCE_WORK_MEM}MB
+# Bounded against max_connections so worst-case concurrent sorts cannot OOM
 work_mem = ${WORK_MEM}MB
 
-# Checkpoint Settings
+# Checkpoint / WAL sizing
+# Raising max_wal_size from the conservative built-in default spreads
+# checkpoints out - Odoo's constant small transactional writes otherwise
+# force needless checkpoint I/O churn.
 checkpoint_completion_target = 0.9
+checkpoint_timeout = 15min
+max_wal_size = ${MAX_WAL_SIZE}
+min_wal_size = ${MIN_WAL_SIZE}
 wal_buffers = 16MB
 default_statistics_target = 100
 
-# Query Planner
+# Query Planner (all deployments run on NVMe/SSD storage)
 random_page_cost = 1.1
 effective_io_concurrency = 200
+maintenance_io_concurrency = 200
+
+# Parallel query - this is what makes a single multi-million-row report scan
+# fan out across cores. Postgres defaults cap every query at 2 workers from a
+# global pool of 8 regardless of core count.
+max_worker_processes = ${MAX_WORKER_PROCESSES}
+max_parallel_workers = ${MAX_PARALLEL_WORKERS}
+max_parallel_workers_per_gather = ${MAX_PARALLEL_PER_GATHER}
+max_parallel_maintenance_workers = ${MAX_PARALLEL_MAINTENANCE}
 
 # Write Ahead Logging
 wal_level = replica
 max_wal_senders = 3
 max_replication_slots = 3
+
+# Observability - lets you verify the tuning actually helps.
+# Query the stats via: SELECT ... FROM pg_stat_statements / pg_stat_io;
+# (run "CREATE EXTENSION pg_stat_statements;" once in the DB you query from)
+shared_preload_libraries = 'pg_stat_statements'
+pg_stat_statements.track = all
+track_io_timing = on
+
+# Safety timeouts
+# statement_timeout stays 0: Odoo enforces its own limit_time_cpu/real and a
+# global cap here would kill long module installs/upgrades.
+statement_timeout = 0
+# Abandoned transactions hold connections and block autovacuum; 30min sits
+# safely above Odoo's limit_time_real (20min).
+idle_in_transaction_session_timeout = 1800s
 
 # Logging
 log_destination = 'stderr'
@@ -519,7 +750,7 @@ log_temp_files = 0
 
 # Performance
 autovacuum = on
-autovacuum_max_workers = 3
+autovacuum_max_workers = ${AUTOVACUUM_WORKERS}
 autovacuum_naptime = 20s
 autovacuum_vacuum_threshold = 50
 autovacuum_analyze_threshold = 50
@@ -540,6 +771,27 @@ timezone = 'UTC'
 ssl = off
 password_encryption = scram-sha-256
 EOF
+
+# PostgreSQL 18+ asynchronous I/O - these GUCs do not exist on older versions
+# and would prevent startup, so the block is strictly version-gated.
+if [ "$PG_VERSION" -ge 18 ]; then
+    cat >> conf/postgresql/postgresql.conf << EOF
+
+# Asynchronous I/O (PostgreSQL 18+)
+# 'worker' async I/O; io_uring is deliberately NOT used because Docker's
+# default seccomp profile blocks io_uring syscalls (postgres would fail to
+# start). If running with a custom seccomp profile that allows it AND the
+# image links liburing (postgres:18 bookworm does), io_uring is a valid
+# opt-in here after testing.
+io_method = worker
+# Scaled to ~1/4 of CPU threads (default is a fixed 3, starving many-core hosts)
+io_workers = ${IO_WORKERS}
+# -1 = auto-derive from shared_buffers / connection settings (explicit defaults,
+# kept visible here as the knobs to revisit with real workload benchmarks)
+io_max_concurrency = -1
+io_combine_limit = 128kB
+EOF
+fi
 
 # Create pg_hba.conf for authentication
 cat > conf/postgresql/pg_hba.conf << 'EOF'
@@ -562,6 +814,62 @@ EOF
 
 print_status "PostgreSQL ${PG_VERSION} auto-configured with ${SHARED_BUFFERS}MB shared_buffers"
 
+# Create PgBouncer configuration
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    mkdir -p conf/pgbouncer
+
+    cat > conf/pgbouncer/pgbouncer.ini << EOF
+; PgBouncer configuration - Auto-generated for Odoo
+; System: ${CPU_CORES} cores, ${NUM_VERSIONS} Odoo version(s)
+
+[databases]
+; Odoo's realtime bus does LISTEN/NOTIFY on the 'postgres' maintenance DB
+; (verified in odoo/addons/bus/models/bus.py across 16..19: both the
+; ImDispatch LISTEN loop and the postcommit NOTIFY use db_connect('postgres')).
+; LISTEN breaks under transaction pooling, so this one database is pinned to
+; session mode. The Odoo database manager (CREATE DATABASE) also lives here.
+postgres = host=db port=5432 dbname=postgres pool_mode=session
+
+; Every actual Odoo database: transaction pooling - client connections are
+; multiplexed onto a small backend pool, decoupling Odoo worker count from
+; postgres max_connections.
+* = host=db port=5432
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+; pgbouncer answers on 5432 itself so Odoo's db_port stays unchanged
+listen_port = 5432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+admin_users = odoo
+
+pool_mode = transaction
+max_client_conn = ${PGB_MAX_CLIENT_CONN}
+; per database/user pair - reports hold a backend for their whole transaction
+default_pool_size = ${PGB_DEFAULT_POOL_SIZE}
+min_pool_size = 0
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+; one busy database cannot starve the others
+max_db_connections = ${PGB_MAX_DB_CONNECTIONS}
+server_idle_timeout = 600
+
+; psycopg2 sends this at connect time; pass it through instead of rejecting
+ignore_startup_parameters = extra_float_digits
+
+log_connections = 0
+log_disconnections = 0
+EOF
+
+    # Plaintext password in the auth file works with scram on both sides:
+    # pgbouncer derives what it needs for client auth and server auth.
+    cat > conf/pgbouncer/userlist.txt << 'EOF'
+"odoo" "odoo"
+EOF
+
+    print_status "PgBouncer configured: transaction pooling (pool=${PGB_DEFAULT_POOL_SIZE}/db), session mode for bus"
+fi
+
 # Create config files and entrypoints for each version
 for version in "${VALID_VERSIONS[@]}"; do
     PORT=$((8066 + version - 16))
@@ -575,46 +883,11 @@ for version in "${VALID_VERSIONS[@]}"; do
 
     print_status "Creating auto-configured Odoo ${version}..."
 
-    # Calculate workers based on system resources.
-    # Pure bash arithmetic (80% safety factor) - bc is not installed on
-    # minimal server images and its silent failure used to force workers=0.
-    available_ram_mb=$(( TOTAL_RAM_MB * 80 / 100 ))
-    
-    # Reserve 1GB for OS and DB
-    RESERVED_RAM=1024
-    
-    # Worker memory limits (in MB)
-    # If system has < 4GB RAM, use smaller workers
-    if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
-        WORKER_MEMORY_MB=512
-        SOFT_LIMIT_MB=400
-    elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
-        WORKER_MEMORY_MB=1024
-        SOFT_LIMIT_MB=800
-    else
-        WORKER_MEMORY_MB=2048
-        SOFT_LIMIT_MB=1600
-    fi
-
-    max_workers_by_ram=$(( (available_ram_mb - RESERVED_RAM) / WORKER_MEMORY_MB ))
-    max_workers_by_cpu=$(( CPU_CORES * 2 + 1 )) # Standard Odoo recommendation
-
-    # Use the smaller of the two limits for safety
-    OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
-
-    # Ensure minimum of 2 workers (one for cron/longpoll, one for HTTP) if resources allow
-    if [ $OPTIMAL_WORKERS -lt 1 ]; then
-        OPTIMAL_WORKERS=0 # Single-threaded if very low resources
-    elif [ $OPTIMAL_WORKERS -gt 8 ]; then
-        OPTIMAL_WORKERS=8 # Cap at 8 workers per version to avoid overwhelming DB
-    fi
-
+    # Worker count, memory limits and connection budget all come from the
+    # unified tuning block near the top of this script - one formula for the
+    # whole stack, already divided across the ${NUM_VERSIONS} deployed version(s).
     DEV_WORKERS=$OPTIMAL_WORKERS
     PROD_WORKERS=$OPTIMAL_WORKERS
-
-    # Calculate bytes for Odoo config
-    HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
-    SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
 
     # Create comprehensive odoo.conf
     if [[ "$USE_NGINX" == "true" ]]; then
@@ -640,11 +913,12 @@ for version in "${VALID_VERSIONS[@]}"; do
     cat > "${version}-config/odoo.conf" << EOF
 [options]
 # Database
-db_host = db
+db_host = ${ODOO_DB_HOST}
 db_port = 5432
 db_user = odoo
 db_password = odoo
-db_maxconn = 64
+# Per-process pool cap, scaled with worker count (matches pg max_connections budget)
+db_maxconn = ${DB_MAXCONN}
 
 # Server
 addons_path = ${ADDONS_PATH}
@@ -652,9 +926,9 @@ data_dir = /var/lib/odoo
 admin_passwd = ${ADMIN_PASSWD}
 http_port = 8069
 
-# Workers: Auto-configured for this system (${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM)
+# Workers: Auto-configured for this system (${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} version(s) sharing)
 workers = ${DEV_WORKERS}
-max_cron_threads = 2
+max_cron_threads = ${MAX_CRON_THREADS}
 
 # Memory limits (in bytes) - Auto-calculated
 limit_memory_hard = ${HARD_LIMIT_BYTES}
@@ -940,19 +1214,26 @@ mkdir -p conf/nginx
 mkdir -p conf/nginx/conf.d
 
 if [[ "$USE_NGINX" == "true" ]]; then
-    # Create main nginx.conf
-    cat > conf/nginx/nginx.conf << 'EOF'
+    # Create main nginx.conf - worker limits scaled to detected CPU cores
+    cat > conf/nginx/nginx.conf << EOF
 user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log warn;
 pid /var/run/nginx.pid;
 
+# Must sit comfortably above worker_connections*2 (each proxied client costs
+# a downstream + an upstream fd) or raising worker_connections does nothing.
+worker_rlimit_nofile ${NGINX_RLIMIT_NOFILE};
+
 events {
-    worker_connections 1024;
+    worker_connections ${NGINX_WORKER_CONNECTIONS};
     use epoll;
     multi_accept on;
 }
 
+EOF
+
+    cat >> conf/nginx/nginx.conf << 'EOF'
 http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
@@ -1002,12 +1283,12 @@ EOF
 # Upstream for Odoo ${version}
 upstream odoo${version} {
     server odoo${version}:8069;
-    keepalive 32;
+    keepalive ${NGINX_KEEPALIVE};
 }
 
 upstream odoo${version}chat {
     server odoo${version}:8072;
-    keepalive 16;
+    keepalive ${NGINX_KEEPALIVE_CHAT};
 }
 
 EOF
@@ -1065,11 +1346,10 @@ server {
         return 404;
     }
 
-    # Block SQL injection attempts
-    location ~* (union.*select|insert.*into|drop.*table|update.*set|delete.*from) {
-        deny all;
-        return 403;
-    }
+    # NOTE: no SQL-injection regex filtering here on purpose. Nginx location
+    # matching only sees the decoded URI path (never the query string), so
+    # such regexes catch nothing real while risking false positives on
+    # legitimate Odoo routes. SQL injection defense belongs in the ORM.
 
     # WebSocket/Longpolling
     location /websocket {
@@ -1398,10 +1678,16 @@ server {
 }
 EOF
 
-# Create performance tuning script
+# Create performance tuning script.
+# IMPORTANT: this helper mirrors the EXACT formulas used at deploy time (the
+# unified tuning block in autodeploy-nginx.sh). If you change one, change both
+# - a diverging helper recommends configs that disagree with what's deployed.
 cat > conf/performance-tuner.sh << 'EOF'
 #!/bin/bash
 # Odoo Performance Tuning Helper
+# Re-runs the deploy-time tuning math against current hardware and compares
+# with what is actually deployed. Useful after a RAM/CPU upgrade to see what
+# a redeploy would give you.
 
 set -e
 
@@ -1418,70 +1704,115 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 echo "🚀 Odoo Performance Tuning Helper"
 echo
 
+clamp() {
+    local v=$1 lo=$2 hi=$3
+    [ "$v" -lt "$lo" ] && v=$lo
+    [ "$v" -gt "$hi" ] && v=$hi
+    echo "$v"
+}
+
 # Detect system resources
 CPU_CORES=$(nproc)
-TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
 TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+
+# Number of deployed Odoo versions sharing this host (from docker-compose.yml)
+COMPOSE_FILE="docker-compose.yml"
+[ -f "$COMPOSE_FILE" ] || COMPOSE_FILE="../docker-compose.yml"
+# grep -c prints the count but exits non-zero on 0 matches; '|| true' keeps
+# set -e happy without corrupting the value
+NUM_VERSIONS=$(grep -cE '^  odoo[0-9]+:' "$COMPOSE_FILE" 2>/dev/null || true)
+case "$NUM_VERSIONS" in ''|0|*[!0-9]*) NUM_VERSIONS=1 ;; esac
+
+# PgBouncer deployments decouple workers from the postgres connection budget
+USE_PGBOUNCER=false
+grep -qE '^  pgbouncer:' "$COMPOSE_FILE" 2>/dev/null && USE_PGBOUNCER=true
 
 print_info "System Resources Detected:"
 echo "  CPU Cores: $CPU_CORES"
-echo "  Total RAM: ${TOTAL_RAM_GB}GB (${TOTAL_RAM_MB}MB)"
+echo "  Total RAM: ${TOTAL_RAM_MB}MB"
+echo "  Odoo versions sharing host: $NUM_VERSIONS"
+echo "  PgBouncer pooler: $USE_PGBOUNCER"
 echo
 
-# Calculate optimal workers
-OPTIMAL_WORKERS=$((CPU_CORES * 2 + 1))
-CONSERVATIVE_WORKERS=$((CPU_CORES + 1))
+# --- Same math as the deploy script ---
+SHARED_BUFFERS=$((TOTAL_RAM_MB / 4))
+[ "$SHARED_BUFFERS" -gt 16384 ] && SHARED_BUFFERS=16384
 
-print_info "Worker Recommendations:"
-echo "  Conservative: $CONSERVATIVE_WORKERS workers (CPU + 1)"
-echo "  Optimal: $OPTIMAL_WORKERS workers (CPU * 2 + 1)"
-echo "  Development: 0 workers (single-threaded with auto-reload)"
-echo
-
-# Calculate memory requirements - Consistent allocation
-WORKER_MEMORY_MB=2048  # 2GB per worker consistently
-
-RAM_NEEDED_CONSERVATIVE=$((CONSERVATIVE_WORKERS * WORKER_MEMORY_MB))
-RAM_NEEDED_OPTIMAL=$((OPTIMAL_WORKERS * WORKER_MEMORY_MB))
-
-print_info "Memory Requirements:"
-echo "  Per worker (consistent): ${WORKER_MEMORY_MB}MB"
-echo "  Conservative setup: ${RAM_NEEDED_CONSERVATIVE}MB"
-echo "  Optimal setup: ${RAM_NEEDED_OPTIMAL}MB"
-echo "  Available: ${TOTAL_RAM_MB}MB"
-echo
-
-if [ $RAM_NEEDED_OPTIMAL -gt $TOTAL_RAM_MB ]; then
-    print_warning "Optimal setup exceeds available RAM!"
-    RECOMMENDED_WORKERS=$CONSERVATIVE_WORKERS
+if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+    WORKER_MEMORY_MB=512;  SOFT_LIMIT_MB=400
+elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+    WORKER_MEMORY_MB=1024; SOFT_LIMIT_MB=800
 else
-    RECOMMENDED_WORKERS=$OPTIMAL_WORKERS
+    WORKER_MEMORY_MB=2048; SOFT_LIMIT_MB=1600
 fi
 
-print_success "Recommended Configuration:"
-echo "  workers = $RECOMMENDED_WORKERS"
-echo "  max_cron_threads = 2"
-echo "  limit_memory_hard = 2147483648  # 2GB"
-echo "  limit_memory_soft = 1825361100  # 1.7GB"
-echo "  db_maxconn = 64"
+MAX_CRON_THREADS=2
+available_ram_mb=$(( TOTAL_RAM_MB * 80 / 100 ))
+RESERVED_RAM=$(( 512 + SHARED_BUFFERS ))
+odoo_ram_budget=$(( available_ram_mb - RESERVED_RAM ))
+[ "$odoo_ram_budget" -lt 0 ] && odoo_ram_budget=0
+max_workers_by_ram=$(( odoo_ram_budget / NUM_VERSIONS / SOFT_LIMIT_MB ))
+max_workers_by_cpu=$(( (CPU_CORES * 2 + 1 + NUM_VERSIONS - 1) / NUM_VERSIONS ))
+OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
+[ "$OPTIMAL_WORKERS" -lt 1 ] && OPTIMAL_WORKERS=0
+
+if [ "$USE_PGBOUNCER" = "true" ]; then
+    # Pooled: workers bounded by CPU/RAM only
+    MAX_CONNECTIONS=$(clamp $(( CPU_CORES * 4 + 20 )) 100 500)
+else
+    PER_VERSION_CONNS=$(( OPTIMAL_WORKERS * 2 + MAX_CRON_THREADS + 8 ))
+    MAX_CONNECTIONS=$(( PER_VERSION_CONNS * NUM_VERSIONS * 120 / 100 + 10 ))
+    [ "$MAX_CONNECTIONS" -lt 100 ] && MAX_CONNECTIONS=100
+    if [ "$MAX_CONNECTIONS" -gt 1000 ]; then
+        MAX_CONNECTIONS=1000
+        budget_per_version=$(( (MAX_CONNECTIONS - 10) * 100 / 120 / NUM_VERSIONS ))
+        OPTIMAL_WORKERS=$(( (budget_per_version - MAX_CRON_THREADS - 8) / 2 ))
+    fi
+fi
+DB_MAXCONN=$(clamp $(( OPTIMAL_WORKERS * 2 + 16 )) 64 256)
+
+HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
+SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
+
+print_info "Recommended per version (deploy-time formula):"
+echo "  RAM limited:  $max_workers_by_ram workers"
+echo "  CPU limited:  $max_workers_by_cpu workers"
+echo "  workers = $OPTIMAL_WORKERS"
+echo "  db_maxconn = $DB_MAXCONN"
+echo "  limit_memory_hard = $HARD_LIMIT_BYTES  # ${WORKER_MEMORY_MB}MB"
+echo "  limit_memory_soft = $SOFT_LIMIT_BYTES  # ${SOFT_LIMIT_MB}MB"
+echo "  (postgres max_connections should be $MAX_CONNECTIONS)"
+echo
+
+# Compare with what is actually deployed
+for conf in [0-9][0-9]-config/odoo.conf ../[0-9][0-9]-config/odoo.conf; do
+    [ -f "$conf" ] || continue
+    deployed_workers=$(grep -E '^workers *=' "$conf" | head -1 | tr -d ' ' | cut -d= -f2)
+    deployed_maxconn=$(grep -E '^db_maxconn *=' "$conf" | head -1 | tr -d ' ' | cut -d= -f2)
+    if [ "$deployed_workers" != "$OPTIMAL_WORKERS" ] || [ "$deployed_maxconn" != "$DB_MAXCONN" ]; then
+        print_warning "$conf: deployed workers=$deployed_workers db_maxconn=$deployed_maxconn differ from recommendation - hardware may have changed since deploy"
+    else
+        print_success "$conf: matches current hardware recommendation"
+    fi
+done
 echo
 
 # Generate config snippet
 cat > performance-config.conf << EOL
-# Generated Performance Configuration
-# System: ${CPU_CORES} cores, ${TOTAL_RAM_GB}GB RAM
+# Generated Performance Configuration (same formula as deploy time)
+# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} version(s)
 # Generated: $(date)
 
 [options]
 # Performance settings
-workers = $RECOMMENDED_WORKERS
-max_cron_threads = 2
-limit_memory_hard = 2147483648
-limit_memory_soft = 1825361100
+workers = $OPTIMAL_WORKERS
+max_cron_threads = $MAX_CRON_THREADS
+limit_memory_hard = $HARD_LIMIT_BYTES
+limit_memory_soft = $SOFT_LIMIT_BYTES
 limit_request = 8192
 limit_time_cpu = 600
 limit_time_real = 1200
-db_maxconn = 64
+db_maxconn = $DB_MAXCONN
 
 # For production, also set:
 # proxy_mode = True
@@ -1619,7 +1950,7 @@ show_urls() {
         echo ""
         for version in "${AVAILABLE_VERSIONS[@]}"; do
             if docker compose ps odoo$version --format json 2>/dev/null | grep -q '"State":"running"'; then
-                status="�"
+                status="[RUNNING]"
             else
                 status="[STOPPED]"
             fi
@@ -2097,9 +2428,16 @@ else
     REBUILD_DOC_HINT="pulls latest official images and restarts"
 fi
 
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    PGB_README_LINE="- **PgBouncer**: service \`pgbouncer\` - Odoo connects through it (transaction pooling; the bus/LISTEN traffic on the \`postgres\` DB is session-pooled automatically)"
+else
+    PGB_README_LINE=""
+fi
+
 cat >> README.md << EOF
 **Database:**
 - **PostgreSQL**: internal only, service \`db\` (odoo/odoo)
+${PGB_README_LINE}
 
 **Credentials:**
 - Master password (database manager): \`admin_passwd\` in \`{VERSION}-config/odoo.conf\`
@@ -2185,7 +2523,15 @@ echo
 print_status "Configuration Summary:"
 echo "  - Custom entrypoints with proper config loading"
 echo "  - PostgreSQL ${PG_VERSION} optimized for ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM"
-echo "  - Odoo workers: ${DEV_WORKERS} (development) / ${PROD_WORKERS} (production)"
+if [ "$PG_VERSION" -ge 18 ]; then
+    echo "  - PostgreSQL async I/O: io_method=worker, io_workers=${IO_WORKERS}"
+fi
+echo "  - Parallel query: up to ${MAX_PARALLEL_PER_GATHER} workers/query from a pool of ${MAX_PARALLEL_WORKERS}"
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    echo "  - PgBouncer: transaction pooling (${PGB_DEFAULT_POOL_SIZE}/db pool, ${PGB_MAX_CLIENT_CONN} max clients), bus in session mode"
+fi
+echo "  - Connection budget: max_connections=${MAX_CONNECTIONS}, db_maxconn=${DB_MAXCONN} (${NUM_VERSIONS} version(s))"
+echo "  - Odoo workers per version: ${DEV_WORKERS} (development) / ${PROD_WORKERS} (production)"
 echo "  - SELinux-compatible volume mounts"
 if [[ "$BAKE_IMAGE" == "true" ]]; then
     echo "  - Python requirements baked into custom images ({VERSION}-build/)"
