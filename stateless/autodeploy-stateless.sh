@@ -9,8 +9,8 @@
 #
 # Architecture:
 #   - Stateless Odoo workers (web + chat separated, web horizontally scalable)
-#   - PgBouncer connection pooling (session mode)
-#   - PostgreSQL optimized for massive concurrency
+#   - PgBouncer transaction pooling ('postgres' bus DB pinned to session mode)
+#   - PostgreSQL 18 (default) with async I/O + parallel query tuning
 #   - MinIO S3-compatible object storage for filestore
 #   - Redis session store via camptocamp session_redis module (redis db 1)
 #   - Production-grade Nginx proxy (port 8080)
@@ -28,10 +28,13 @@
 #
 # Architectural Trade-offs & Design Decisions:
 #
-#   1. PgBouncer Session Mode (not Transaction Mode)
-#      - WHY: Works with any Odoo version, no code patches needed
-#      - TRADE-OFF: Caps at ~100-200 concurrent connections vs thousands
-#      - SCALE PATH: For 128+ cores, switch to transaction mode + bus_alt_connection
+#   1. PgBouncer Transaction Mode + session-pinned 'postgres' database
+#      - WHY: Odoo's bus does LISTEN/NOTIFY exclusively on the 'postgres'
+#        maintenance DB (verified in odoo/addons/bus/models/bus.py, 16..19).
+#        Pinning just that DB to session mode keeps realtime chat working
+#        while every real database gets true connection multiplexing.
+#      - RESULT: Odoo worker count is decoupled from postgres max_connections
+#        - no code patches, no bus_alt_connection module needed.
 #
 #   2. Single Deployment (not Multi-Role)
 #      - WHY: Simplicity - one script, one deployment
@@ -65,13 +68,15 @@ set -o pipefail
 # COLORS AND FORMATTING
 #===============================================================================
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-NC='\033[0m'
+# ANSI-C quoting ($'...') stores real escape bytes, so the colors render both
+# through echo -e AND inside cat heredocs (the final summary banner)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+MAGENTA=$'\033[0;35m'
+NC=$'\033[0m'
 
 print_header() { echo -e "\n${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"; echo -e "${CYAN}║  $1${NC}"; echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"; }
 print_status() { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -84,6 +89,14 @@ print_input() { echo -e "${MAGENTA}[?]${NC} $1"; }
 #===============================================================================
 # SYSTEM RESOURCE DETECTION
 #===============================================================================
+
+# clamp VALUE MIN MAX
+clamp() {
+    local v=$1 lo=$2 hi=$3
+    [ "$v" -lt "$lo" ] && v=$lo
+    [ "$v" -gt "$hi" ] && v=$hi
+    echo "$v"
+}
 
 detect_system_resources() {
     print_header "Detecting System Resources"
@@ -109,76 +122,116 @@ detect_system_resources() {
     echo "  OS Buffer: ${OS_BUFFER_MB}MB (10%)"
     echo "  Odoo Workers: ${ODOO_POOL_MB}MB (50%)"
 
-    # Worker Calculation
-    WORKER_RAM_MB=1024  # 1GB per worker (safe estimate)
-    MAX_WORKERS_RAM=$((ODOO_POOL_MB / WORKER_RAM_MB))
-    MAX_WORKERS_CPU=$((TOTAL_CORES * 2 + 1))
+    # Worker memory tiers by total RAM. limit_memory_soft is what a worker
+    # normally uses (recycled above it); limit_memory_hard is the emergency
+    # ceiling one request may spike to (big report renders). Planning worker
+    # count on the SOFT limit packs more workers while the hard ceiling
+    # still protects the host - same model as autodeploy-nginx.sh.
+    if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+        WORKER_MEMORY_MB=512;  SOFT_LIMIT_MB=400
+    elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+        WORKER_MEMORY_MB=1024; SOFT_LIMIT_MB=800
+    else
+        WORKER_MEMORY_MB=2048; SOFT_LIMIT_MB=1600
+    fi
+    HARD_LIMIT_BYTES=$((WORKER_MEMORY_MB * 1024 * 1024))
+    SOFT_LIMIT_BYTES=$((SOFT_LIMIT_MB * 1024 * 1024))
 
-    # Use the smaller of the two to avoid resource exhaustion
-    if [ $MAX_WORKERS_RAM -lt $MAX_WORKERS_CPU ]; then
+    # Worker Calculation: RAM budget on soft limit, capped by CPU
+    MAX_WORKERS_RAM=$((ODOO_POOL_MB / SOFT_LIMIT_MB))
+    MAX_WORKERS_CPU=$((TOTAL_CORES * 2 + 1))
+    if [ "$MAX_WORKERS_RAM" -lt "$MAX_WORKERS_CPU" ]; then
         ACTUAL_HTTP_WORKERS=$MAX_WORKERS_RAM
     else
         ACTUAL_HTTP_WORKERS=$MAX_WORKERS_CPU
     fi
+    [ "$ACTUAL_HTTP_WORKERS" -lt 2 ] && ACTUAL_HTTP_WORKERS=2
 
-    # Ensure minimum of 2 workers
-    if [ $ACTUAL_HTTP_WORKERS -lt 2 ]; then
-        ACTUAL_HTTP_WORKERS=2
-    fi
+    MAX_CRON_THREADS=$(clamp $((ACTUAL_HTTP_WORKERS / 4)) 2 4)
 
-    # PgBouncer pool sizing
-    # Session mode doesn't pool, so this is just for PgBouncer's client connection limit
-    DEFAULT_POOL_SIZE=$((ACTUAL_HTTP_WORKERS + 10))
-
-    # PostgreSQL max_connections calculation for session mode
-    # Formula: (web workers * 2 + 5) + (chat: 10) + (buffer for multiple DBs: 50) + (system: 10)
-    # This ensures enough connections for multiple databases
-    WEB_DB_MAXCONN=$((ACTUAL_HTTP_WORKERS * 2 + 2 + 5))
+    # Odoo-side connection pools
+    WEB_DB_MAXCONN=$((ACTUAL_HTTP_WORKERS * 2 + MAX_CRON_THREADS + 5))
     CHAT_DB_MAXCONN=10
-    PG_MAX_CONNECTIONS=$(( (WEB_DB_MAXCONN + CHAT_DB_MAXCONN) * 3 + 10 ))
 
-    # Ensure minimum of 100 connections
-    if [ $PG_MAX_CONNECTIONS -lt 100 ]; then
-        PG_MAX_CONNECTIONS=100
+    # PostgreSQL max_connections: PgBouncer runs in TRANSACTION mode (with the
+    # 'postgres' bus database pinned to session mode), so client connections
+    # are multiplexed onto a small backend pool. The backend budget scales
+    # with cores, not with Odoo worker count.
+    PG_MAX_CONNECTIONS=$(clamp $((TOTAL_CORES * 4 + 20)) 100 500)
+
+    # PgBouncer pool sizing (transaction mode)
+    # Per database/user pair; big reports hold a backend for their whole
+    # transaction, so give each database room to fan out.
+    PGB_DEFAULT_POOL_SIZE=$(clamp $((TOTAL_CORES * 2)) 8 64)
+    # One busy database cannot starve the others
+    PGB_MAX_DB_CONNECTIONS=$((PG_MAX_CONNECTIONS - 20))
+    # Client side is cheap: every web replica may hold up to db_maxconn,
+    # leave generous headroom for horizontal scaling (scale-web N)
+    PGB_MAX_CLIENT_CONN=$(clamp $(( (WEB_DB_MAXCONN + CHAT_DB_MAXCONN) * 16 )) 400 4000)
+
+    # PostgreSQL memory. The container is memory-limited to PG_RAM_MB and its
+    # page cache is charged against that same cgroup, so:
+    #   shared_buffers      40% of the allocation (capped at 16GB)
+    #   effective_cache     75% of the allocation (advisory: buffers + page cache)
+    PG_SHARED_BUFFERS=$(clamp $((PG_RAM_MB * 40 / 100)) 128 16384)
+    PG_EFFECTIVE_CACHE=$((PG_RAM_MB * 75 / 100))
+    PG_MAINTENANCE_WORK_MEM=$(clamp $((PG_RAM_MB / 8)) 64 2048)
+
+    # work_mem: transaction pooling bounds concurrent backends near the pool
+    # size, so this can be far more generous than the classic
+    # RAM/(max_connections*4) - which is what makes big sorts/aggregations fly.
+    PG_WORK_MEM=$(clamp $((PG_RAM_MB / (PG_MAX_CONNECTIONS / 2))) 4 64)
+
+    # Parallel query: let one big report query fan out across cores
+    PG_MAX_WORKER_PROCESSES=$(clamp "$TOTAL_CORES" 8 128)
+    PG_MAX_PARALLEL_WORKERS=$(clamp "$TOTAL_CORES" 8 128)
+    PG_MAX_PARALLEL_PER_GATHER=$(clamp $((TOTAL_CORES / 4)) 2 8)
+    PG_MAX_PARALLEL_MAINTENANCE=$(clamp $((TOTAL_CORES / 8)) 2 4)
+
+    # Autovacuum workers scale with cores
+    PG_AUTOVACUUM_WORKERS=$(clamp $((TOTAL_CORES / 4)) 3 8)
+
+    # WAL sizing and postgres shared memory (/dev/shm) by RAM tier
+    if [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+        MAX_WAL_SIZE="2GB";  MIN_WAL_SIZE="512MB"
+    elif [ "$TOTAL_RAM_MB" -lt 32768 ]; then
+        MAX_WAL_SIZE="4GB";  MIN_WAL_SIZE="1GB"
+    else
+        MAX_WAL_SIZE="8GB";  MIN_WAL_SIZE="2GB"
+    fi
+    if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+        SHM_SIZE="256mb"
+    elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+        SHM_SIZE="512mb"
+    elif [ "$TOTAL_RAM_MB" -lt 32768 ]; then
+        SHM_SIZE="1gb"
+    else
+        SHM_SIZE="2gb"
     fi
 
-    # PostgreSQL tuning calculations
-    PG_SHARED_BUFFERS=$((PG_RAM_MB * 25 / 100))      # 25% of PG allocation
-    PG_EFFECTIVE_CACHE=$((PG_RAM_MB * 75 / 100))     # 75% of PG allocation
-    PG_MAINTENANCE_WORK_MEM=$((PG_RAM_MB / 16))      # ~6% of PG allocation
-    PG_WORK_MEM=$((PG_RAM_MB / (PG_MAX_CONNECTIONS * 4)))  # Per connection
+    # PostgreSQL 18+ async I/O worker pool (io_method=worker; io_uring is
+    # blocked by Docker's default seccomp profile, so worker mode it is)
+    PG_IO_WORKERS=$(clamp $((TOTAL_CORES / 4)) 3 32)
 
-    # Floor work_mem at 4MB - integer division on small hosts can hit 0,
-    # which is below PostgreSQL's minimum (64kB) and produces bad plans anyway
-    if [ $PG_WORK_MEM -lt 4 ]; then
-        PG_WORK_MEM=4
-    fi
+    # Chat container: gevent is single-process but the bus fans out to every
+    # connected browser tab - give it a little room on big hosts
+    CHAT_CPUS=$(clamp $((TOTAL_CORES / 8)) 2 8)
+    CHAT_RAM_MB=$((WORKER_MEMORY_MB + 512))
 
-    # Parallel workers
-    PG_MAX_PARALLEL_WORKERS=$TOTAL_CORES
-    PG_MAX_PARALLEL_PER_GATHER=$((TOTAL_CORES / 4))
-    if [ $PG_MAX_PARALLEL_PER_GATHER -lt 2 ]; then
-        PG_MAX_PARALLEL_PER_GATHER=2
-    fi
-
-    # Autovacuum workers - scale with cores for high-core systems
-    PG_AUTOVACUUM_WORKERS=$((TOTAL_CORES / 8))
-    if [ $PG_AUTOVACUUM_WORKERS -lt 4 ]; then
-        PG_AUTOVACUUM_WORKERS=4
-    fi
-    if [ $PG_AUTOVACUUM_WORKERS -gt 16 ]; then
-        PG_AUTOVACUUM_WORKERS=16  # Cap at 16 to avoid overhead
-    fi
+    # Internal nginx scaling
+    NGINX_WORKER_CONNECTIONS=$(clamp $((TOTAL_CORES * 1024)) 2048 8192)
+    NGINX_RLIMIT_NOFILE=$((NGINX_WORKER_CONNECTIONS * 2))
+    NGINX_KEEPALIVE=$(clamp $((ACTUAL_HTTP_WORKERS * 2)) 16 64)
 
     print_success "Calculated Configuration:"
-    echo "  HTTP Workers: ${ACTUAL_HTTP_WORKERS}"
+    echo "  HTTP Workers: ${ACTUAL_HTTP_WORKERS} (soft ${SOFT_LIMIT_MB}MB / hard ${WORKER_MEMORY_MB}MB each)"
     echo "  Odoo web db_maxconn: ${WEB_DB_MAXCONN}"
     echo "  Odoo chat db_maxconn: ${CHAT_DB_MAXCONN}"
-    echo "  PgBouncer client limit: ${DEFAULT_POOL_SIZE}"
+    echo "  PgBouncer: transaction pooling, ${PGB_DEFAULT_POOL_SIZE}/db pool, ${PGB_MAX_CLIENT_CONN} client slots"
     echo "  PostgreSQL max_connections: ${PG_MAX_CONNECTIONS}"
+    echo "  PostgreSQL shared_buffers: ${PG_SHARED_BUFFERS}MB, work_mem: ${PG_WORK_MEM}MB"
+    echo "  PostgreSQL parallel: ${PG_MAX_PARALLEL_PER_GATHER}/query from a pool of ${PG_MAX_PARALLEL_WORKERS}"
     echo "  PostgreSQL autovacuum_workers: ${PG_AUTOVACUUM_WORKERS}"
-    echo "  PostgreSQL shared_buffers: ${PG_SHARED_BUFFERS}MB"
-    echo "  PostgreSQL work_mem: ${PG_WORK_MEM}MB"
     echo ""
 }
 
@@ -186,7 +239,8 @@ detect_system_resources() {
 # WELCOME AND PROJECT SETUP
 #===============================================================================
 
-clear
+# Non-fatal in non-interactive shells (piped stdin, dumb terminals) - set -e
+clear 2>/dev/null || true
 cat << "EOF"
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                                                                           ║
@@ -206,7 +260,7 @@ EOF
 echo -e "${CYAN}Features:${NC}"
 echo "  ✓ Stateless architecture (no local filestore)"
 echo "  ✓ Auto-scaling workers based on system resources"
-echo "  ✓ PgBouncer session-mode pooling (safe for CREATE DATABASE)"
+echo "  ✓ PgBouncer transaction pooling (bus DB session-pinned, chat-safe)"
 echo "  ✓ MinIO S3-compatible object storage"
 echo "  ✓ Redis session management (session_redis module)"
 echo "  ✓ Separated web/chat containers"
@@ -250,9 +304,10 @@ if [[ ! "$ODOO_VERSION" =~ ^(16|17|18|19)$ ]]; then
     exit 1
 fi
 
-# PostgreSQL version selection (recommended: 17 for Odoo <=18, 18 for Odoo 19)
-PG_VERSION_DEFAULT=17
-[ "$ODOO_VERSION" -ge 19 ] && PG_VERSION_DEFAULT=18
+# PostgreSQL 18 by default: async I/O (io_method=worker) gives sequential
+# scans, vacuums and bitmap heap scans a real boost on NVMe/SSD, and every
+# supported Odoo version (16-19) runs fine on it.
+PG_VERSION_DEFAULT=18
 print_input "PostgreSQL version (15/16/17/18) [${PG_VERSION_DEFAULT}]:"
 read -r PG_VERSION
 [[ -z "$PG_VERSION" ]] && PG_VERSION=$PG_VERSION_DEFAULT
@@ -337,12 +392,15 @@ read -r
 print_header "Creating Project Structure"
 
 mkdir -p "$PROJECT_NAME"
+# Secrets live in configs the containers must read (non-root container users
+# need 644 files), so host-side secrecy is enforced at the directory level.
+# Bind mounts don't traverse parent dir permissions - containers are unaffected.
+chmod 700 "$PROJECT_NAME"
 cd "$PROJECT_NAME"
 
 # Create directory structure
 mkdir -p config/{odoo,postgresql,pgbouncer,nginx,redis}
 mkdir -p addons/{custom,oca-storage}
-mkdir -p data/{postgres,minio}
 mkdir -p logs/{odoo-web,odoo-chat,nginx,postgres}
 mkdir -p scripts
 
@@ -530,14 +588,10 @@ cat > addons/oca-storage/requirements.txt << 'PYREQ'
 # Base dependencies (required by Odoo module system)
 packaging>=20.0
 
-# fs_storage dependencies
-fsspec>=2024.5.0
-
-# fs_attachment_s3 dependencies (S3/MinIO support)
-s3fs>=2024.5.0
-boto3>=1.26.0
-botocore>=1.29.0
-aiobotocore>=2.5.0
+# fs_attachment_s3 declares fsspec[s3] (= fsspec + s3fs). s3fs pins the exact
+# aiobotocore/botocore range it needs - do NOT list boto3/botocore/aiobotocore
+# explicitly or pip backtracks through dozens of versions hunting a match.
+fsspec[s3]>=2024.5.0
 
 # fs_attachment external deps
 python-slugify>=8.0.0
@@ -596,7 +650,9 @@ if [ -n "$PG_DATA_ENV_LINE" ]; then
 fi
 
 cat >> docker-compose.yml << EOF
-    shm_size: "256mb"
+    # Sized to the RAM tier - parallel query workers exchange tuples through
+    # dynamic shared memory here; the alpine default of 64mb kills big scans
+    shm_size: "${SHM_SIZE}"
     volumes:
       - ${PG_VOLUME_MOUNT}
       - ./config/postgresql/postgresql.conf:/etc/postgresql/postgresql.conf:ro
@@ -829,8 +885,8 @@ ${ENTERPRISE_VOLUME_LINE}
     deploy:
       resources:
         limits:
-          memory: 1024M
-          cpus: '2'
+          memory: ${CHAT_RAM_MB}M
+          cpus: '${CHAT_CPUS}'
     networks:
       - odoo-network
     healthcheck:
@@ -904,9 +960,9 @@ cat > config/postgresql/postgresql.conf << EOF
 #-------------------------------------------------------------------------------
 # CONNECTION SETTINGS
 #-------------------------------------------------------------------------------
-# Session mode requires higher max_connections since PgBouncer doesn't pool
-# Calculated dynamically: (web_maxconn + chat_maxconn) * 3 + system_overhead
-# This supports multiple databases with adequate connection headroom
+# PgBouncer multiplexes client connections in transaction mode, so the backend
+# budget scales with cores (cores*4+20, clamped 100..500) - not with the
+# number of Odoo workers. Fewer backends = more work_mem per query.
 listen_addresses = '*'
 max_connections = ${PG_MAX_CONNECTIONS}
 superuser_reserved_connections = 5
@@ -914,35 +970,50 @@ superuser_reserved_connections = 5
 #-------------------------------------------------------------------------------
 # MEMORY SETTINGS
 #-------------------------------------------------------------------------------
+# Container is cgroup-limited to ${PG_RAM_MB}MB; buffers sized against that
 shared_buffers = ${PG_SHARED_BUFFERS}MB
 effective_cache_size = ${PG_EFFECTIVE_CACHE}MB
 maintenance_work_mem = ${PG_MAINTENANCE_WORK_MEM}MB
 work_mem = ${PG_WORK_MEM}MB
+huge_pages = try
 
 #-------------------------------------------------------------------------------
-# CHECKPOINT AND WAL SETTINGS
+# CHECKPOINT AND WAL SETTINGS (sized to RAM tier)
 #-------------------------------------------------------------------------------
 wal_level = replica
 wal_compression = zstd
-max_wal_size = 4GB
-min_wal_size = 1GB
+max_wal_size = ${MAX_WAL_SIZE}
+min_wal_size = ${MIN_WAL_SIZE}
+checkpoint_timeout = 15min
 checkpoint_completion_target = 0.9
 wal_buffers = 16MB
 
 #-------------------------------------------------------------------------------
-# QUERY PLANNER
+# QUERY PLANNER (NVMe/SSD assumptions)
 #-------------------------------------------------------------------------------
 random_page_cost = 1.1
 effective_io_concurrency = 200
+maintenance_io_concurrency = 200
 default_statistics_target = 100
 
 #-------------------------------------------------------------------------------
 # PARALLEL QUERY EXECUTION
 #-------------------------------------------------------------------------------
-max_worker_processes = ${TOTAL_CORES}
+# One big report query can fan out across ${PG_MAX_PARALLEL_PER_GATHER} workers
+# from a global pool of ${PG_MAX_PARALLEL_WORKERS}
+max_worker_processes = ${PG_MAX_WORKER_PROCESSES}
 max_parallel_workers_per_gather = ${PG_MAX_PARALLEL_PER_GATHER}
 max_parallel_workers = ${PG_MAX_PARALLEL_WORKERS}
-max_parallel_maintenance_workers = 4
+max_parallel_maintenance_workers = ${PG_MAX_PARALLEL_MAINTENANCE}
+
+#-------------------------------------------------------------------------------
+# TIMEOUTS
+#-------------------------------------------------------------------------------
+# No statement_timeout: Odoo enforces limit_time_cpu/limit_time_real itself,
+# and killing a 20-minute report at the DB level helps nobody.
+statement_timeout = 0
+# But a transaction left open in an idle worker holds locks and bloats tables
+idle_in_transaction_session_timeout = 1800s
 
 #-------------------------------------------------------------------------------
 # AUTOVACUUM (AGGRESSIVE FOR HIGH-WRITE WORKLOAD)
@@ -1003,6 +1074,22 @@ track_activity_query_size = 2048
 track_io_timing = on
 EOF
 
+# PostgreSQL 18+: async I/O. io_method=worker is the default but the worker
+# pool is a static 3 - scale it to the hardware. io_uring is not an option
+# here: Docker's default seccomp profile blocks the io_uring syscalls.
+if [ "$PG_VERSION" -ge 18 ]; then
+    cat >> config/postgresql/postgresql.conf << EOF
+
+#-------------------------------------------------------------------------------
+# ASYNC I/O (PostgreSQL 18+)
+#-------------------------------------------------------------------------------
+io_method = worker
+io_workers = ${PG_IO_WORKERS}
+io_max_concurrency = -1
+io_combine_limit = 128kB
+EOF
+fi
+
 print_status "PostgreSQL configuration generated"
 
 #===============================================================================
@@ -1049,18 +1136,26 @@ cat > config/pgbouncer/userlist.txt << EOF
 "odoo" "${DB_PASSWORD}"
 EOF
 
-# Generate pgbouncer.ini with wildcard database routing
+# Generate pgbouncer.ini: transaction pooling with the bus DB session-pinned
 cat > config/pgbouncer/pgbouncer.ini << EOF
 #===============================================================================
-# PGBOUNCER CONFIGURATION - WILDCARD DATABASE ROUTING
+# PGBOUNCER CONFIGURATION - TRANSACTION POOLING, BUS-SAFE
 #===============================================================================
 # Generated: $(date)
-# Allows any database name to be routed to PostgreSQL
 #===============================================================================
 
 [databases]
-# Wildcard routing - allows any database name
-* = host=postgres port=5432 user=odoo password=${DB_PASSWORD}
+# Odoo's realtime bus does LISTEN/NOTIFY on the 'postgres' maintenance DB
+# (verified in odoo/addons/bus/models/bus.py across 16..19: both the
+# ImDispatch LISTEN loop and the postcommit NOTIFY use db_connect('postgres')).
+# LISTEN breaks under transaction pooling, so this one database is pinned to
+# session mode. The Odoo database manager (CREATE DATABASE) also lives here.
+postgres = host=postgres port=5432 pool_mode=session
+
+# Every actual Odoo database: transaction pooling - client connections are
+# multiplexed onto a small backend pool, decoupling Odoo worker count (and
+# scale-web replicas) from postgres max_connections.
+* = host=postgres port=5432
 
 [pgbouncer]
 # Network
@@ -1068,34 +1163,36 @@ listen_addr = 0.0.0.0
 listen_port = 5432
 unix_socket_dir =
 
-# Authentication
+# Authentication (plaintext secret in userlist works with SCRAM on both sides:
+# pgbouncer derives what it needs for client auth and server auth)
 auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
-auth_user = odoo
 
 # Connection pooling
-# IMPORTANT: Session mode is required for database creation operations
-# Transaction mode causes "serialization failure" errors during CREATE DATABASE
-# Trade-off: Session mode doesn't pool connections, so PostgreSQL max_connections
-# must be set high enough to handle all Odoo workers across all databases
-pool_mode = session
-max_client_conn = 1000
-default_pool_size = ${DEFAULT_POOL_SIZE}
-reserve_pool_size = 10
-min_pool_size = 5
+pool_mode = transaction
+max_client_conn = ${PGB_MAX_CLIENT_CONN}
+# Per database/user pair - reports hold a backend for their whole transaction
+default_pool_size = ${PGB_DEFAULT_POOL_SIZE}
+min_pool_size = 0
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+# One busy database cannot starve the others
+max_db_connections = ${PGB_MAX_DB_CONNECTIONS}
 
-# Connection limits
+# Connection lifecycle
 server_idle_timeout = 600
 server_lifetime = 3600
 server_connect_timeout = 15
 server_login_retry = 15
 
 # Query handling
+# (server_reset_query only applies to the session-pinned 'postgres' DB;
+# transaction mode skips it unless server_reset_query_always=1)
 server_reset_query = DISCARD ALL
 server_reset_query_always = 0
 ignore_startup_parameters = extra_float_digits,options
 
-# Logging
+# Admin/stats
 admin_users = postgres,odoo
 stats_users = postgres,odoo
 
@@ -1104,17 +1201,14 @@ query_timeout = 0
 query_wait_timeout = 120
 client_idle_timeout = 0
 idle_transaction_timeout = 0
-
-# Dangerous settings (disabled for safety)
-max_db_connections = 0
-max_user_connections = 0
 EOF
 
-# Set proper permissions for PgBouncer config files
+# Container-readable (pgbouncer runs as a non-root user in the image);
+# the 700 project directory keeps other host users out
 chmod 644 config/pgbouncer/pgbouncer.ini
 chmod 644 config/pgbouncer/userlist.txt
 
-print_status "PgBouncer configuration generated with wildcard database routing"
+print_status "PgBouncer configured: transaction pooling (${PGB_DEFAULT_POOL_SIZE}/db), session mode for the bus DB"
 
 #===============================================================================
 # GENERATE ODOO WEB CONFIGURATION
@@ -1181,13 +1275,15 @@ server_wide_modules = ${SERVER_WIDE_MODULES}
 # WORKERS CONFIGURATION (STATELESS HTTP WORKERS)
 #-------------------------------------------------------------------------------
 workers = ${ACTUAL_HTTP_WORKERS}
-max_cron_threads = 2
+max_cron_threads = ${MAX_CRON_THREADS}
 
 #-------------------------------------------------------------------------------
-# MEMORY LIMITS
+# MEMORY LIMITS (RAM-tiered: soft ${SOFT_LIMIT_MB}MB / hard ${WORKER_MEMORY_MB}MB)
 #-------------------------------------------------------------------------------
-limit_memory_hard = 1073741824
-limit_memory_soft = 858993459
+# Soft: worker recycled after the request finishes. Hard: request killed.
+# Hard is 2x soft headroom so one big report render survives.
+limit_memory_hard = ${HARD_LIMIT_BYTES}
+limit_memory_soft = ${SOFT_LIMIT_BYTES}
 limit_request = 8192
 limit_time_cpu = 600
 limit_time_real = 1200
@@ -1233,7 +1329,9 @@ data_dir = /var/lib/odoo
 EOF
 
 print_status "Odoo web configuration generated"
-chmod 600 config/odoo/odoo-web.conf
+# 644: the odoo container runs as the 'odoo' user and must read this;
+# host-side secrecy comes from the 700 project directory
+chmod 644 config/odoo/odoo-web.conf
 
 #===============================================================================
 # GENERATE ODOO CHAT CONFIGURATION
@@ -1284,10 +1382,10 @@ workers = 0
 max_cron_threads = 0
 
 #-------------------------------------------------------------------------------
-# MEMORY LIMITS
+# MEMORY LIMITS (single gevent process - matches the worker RAM tier)
 #-------------------------------------------------------------------------------
-limit_memory_hard = 1073741824
-limit_memory_soft = 858993459
+limit_memory_hard = ${HARD_LIMIT_BYTES}
+limit_memory_soft = ${SOFT_LIMIT_BYTES}
 limit_request = 8192
 limit_time_cpu = 600
 limit_time_real = 1200
@@ -1332,9 +1430,7 @@ data_dir = /var/lib/odoo
 EOF
 
 print_status "Odoo chat configuration generated"
-chmod 600 config/odoo/odoo-chat.conf
-chmod 600 config/pgbouncer/userlist.txt
-chmod 600 config/pgbouncer/pgbouncer.ini
+chmod 644 config/odoo/odoo-chat.conf
 
 
 #===============================================================================
@@ -1378,11 +1474,13 @@ cat > config/nginx/nginx.conf << EOF
 
 user nginx;
 worker_processes auto;
+# Each proxied client costs ~2 fds (client + upstream)
+worker_rlimit_nofile ${NGINX_RLIMIT_NOFILE};
 error_log /var/log/nginx/error.log warn;
 pid /var/run/nginx.pid;
 
 events {
-    worker_connections 2048;
+    worker_connections ${NGINX_WORKER_CONNECTIONS};
     use epoll;
     multi_accept on;
 }
@@ -1444,7 +1542,7 @@ http {
     upstream odoo_web {
         least_conn;  # Route to least busy worker
         server odoo-web:8069 max_fails=3 fail_timeout=30s;
-        keepalive 32;  # Connection pooling to workers
+        keepalive ${NGINX_KEEPALIVE};  # Connection pooling to workers
     }
 
     upstream odoo_chat {
@@ -1883,7 +1981,9 @@ ODOO_EDITION=${ODOO_EDITION}
 TOTAL_CORES=${TOTAL_CORES}
 TOTAL_RAM_MB=${TOTAL_RAM_MB}
 ACTUAL_HTTP_WORKERS=${ACTUAL_HTTP_WORKERS}
-DEFAULT_POOL_SIZE=${DEFAULT_POOL_SIZE}
+PGB_DEFAULT_POOL_SIZE=${PGB_DEFAULT_POOL_SIZE}
+PGB_MAX_CLIENT_CONN=${PGB_MAX_CLIENT_CONN}
+PG_MAX_CONNECTIONS=${PG_MAX_CONNECTIONS}
 
 #-------------------------------------------------------------------------------
 # DATABASE CREDENTIALS
@@ -1960,7 +2060,8 @@ This deployment uses a **stateless architecture** for maximum scalability:
                               ↓
                     ┌──────────────────┐
                     │    PgBouncer     │
-                    │   Session Mode   │
+                    │ Transaction Mode │
+                    │ (bus DB pinned)  │
                     └──────────────────┘
                               ↓
                     ┌──────────────────┐
@@ -1976,7 +2077,7 @@ This deployment uses a **stateless architecture** for maximum scalability:
 ### Key Features
 
 - ✅ **Stateless Workers**: No local filestore, fully scalable
-- ✅ **PgBouncer**: Session-mode pooling (safe with Odoo CREATE DATABASE)
+- ✅ **PgBouncer**: Transaction pooling; the 'postgres' bus DB is pinned to session mode so LISTEN/NOTIFY (realtime chat) and CREATE DATABASE keep working
 - ✅ **MinIO**: S3-compatible object storage for attachments
 - ✅ **Redis**: Centralized sessions via \`session_redis\` (server-wide module)
 - ✅ **Separated Services**: Web and chat workers optimized independently
@@ -2192,9 +2293,11 @@ This deployment was auto-configured based on your system:
 
 - **PostgreSQL shared_buffers**: ${PG_SHARED_BUFFERS}MB
 - **PostgreSQL work_mem**: ${PG_WORK_MEM}MB
-- **PgBouncer pool size**: ${DEFAULT_POOL_SIZE}
+- **PostgreSQL max_connections**: ${PG_MAX_CONNECTIONS} (transaction pooling keeps this small)
+- **Parallel query**: up to ${PG_MAX_PARALLEL_PER_GATHER} workers/query from a pool of ${PG_MAX_PARALLEL_WORKERS}
+- **PgBouncer**: ${PGB_DEFAULT_POOL_SIZE} backends/db, ${PGB_MAX_CLIENT_CONN} client slots
 - **Odoo workers**: ${ACTUAL_HTTP_WORKERS}
-- **Worker memory limit**: 1GB per worker
+- **Worker memory limit**: soft ${SOFT_LIMIT_MB}MB / hard ${WORKER_MEMORY_MB}MB
 
 ### Optimization Tips
 
@@ -2387,8 +2490,8 @@ S3 Endpoint: http://minio:9000 (internal)
 Total Cores: ${TOTAL_CORES}
 Total RAM: ${TOTAL_RAM_GB}GB
 HTTP Workers: ${ACTUAL_HTTP_WORKERS}
-PgBouncer Pool: ${DEFAULT_POOL_SIZE}
-PostgreSQL Version: ${PG_VERSION}
+PgBouncer: transaction pooling, ${PGB_DEFAULT_POOL_SIZE} backends/db
+PostgreSQL Version: ${PG_VERSION} (max_connections=${PG_MAX_CONNECTIONS})
 
 #-------------------------------------------------------------------------------
 # RESOURCE ALLOCATION
@@ -2534,10 +2637,11 @@ and 200ms DB waits = ~2% CPU and an angry user base.
    - Fixed here via `session_redis` + Redis AOF.
 
 8. **PgBouncer mode**
-   - Session mode (this script): correct for Odoo CREATE DATABASE,
-     limited multiplexing.
-   - Transaction mode: more connections, but needs Odoo patches /
-     careful prepared-statement handling — only for 64+ core farms.
+   - This stack: transaction pooling for every real database, with the
+     'postgres' maintenance DB pinned to session mode — that is where
+     Odoo's bus does LISTEN/NOTIFY and where CREATE DATABASE runs.
+   - Result: worker count and web replicas are decoupled from postgres
+     max_connections, no Odoo patches needed.
 
 ## Docker vs bare metal
 
@@ -2617,7 +2721,7 @@ ${RED}⚠️  SECURITY WARNING:${NC}
 
 ${CYAN}📊 Architecture Highlights:${NC}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✅ PgBouncer session-mode pooling (${DEFAULT_POOL_SIZE} client slots)
+  ✅ PgBouncer transaction pooling (${PGB_DEFAULT_POOL_SIZE} backends/db, ${PGB_MAX_CLIENT_CONN} client slots, bus DB session-pinned)
   ✅ MinIO S3-compatible storage (private bucket)
   ✅ Redis sessions via session_redis (AOF persisted)
   ✅ Separated web/chat containers (web is horizontally scalable)
