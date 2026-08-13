@@ -350,6 +350,7 @@ MINIO_IMAGE="minio/minio:RELEASE.2024-12-18T13-15-44Z"
 MC_IMAGE="minio/mc:RELEASE.2024-11-21T17-21-54Z"
 REDIS_IMAGE="redis:7.4-alpine"
 NGINX_IMAGE="nginx:1.27-alpine"
+BUSYBOX_IMAGE="busybox:1.37"
 
 # pip on Debian bookworm images (Odoo 18/19) enforces PEP 668 and needs
 # --break-system-packages; the flag doesn't exist on the older pip shipped
@@ -605,6 +606,29 @@ PYREQ
 
 print_status "Created consolidated requirements.txt"
 
+# Pre-download wheels on the host (best-effort). First boot then installs
+# offline in seconds instead of pulling ~20MB from PyPI in every container -
+# on a slow or firewalled link that download can take 15+ minutes and leaves
+# nginx serving 502s while Odoo waits on pip.
+case "$ODOO_VERSION" in
+    16) WHEEL_PY=39 ;;   # odoo:16 = Debian bullseye, Python 3.9
+    17) WHEEL_PY=310 ;;  # odoo:17 = Ubuntu jammy, Python 3.10
+    *)  WHEEL_PY=312 ;;  # odoo:18/19 = Debian bookworm, Python 3.12
+esac
+if python3 -m pip --version >/dev/null 2>&1; then
+    print_info "Pre-downloading Python wheels for the containers (Python 3.${WHEEL_PY#3})..."
+    if python3 -m pip download -r addons/oca-storage/requirements.txt \
+            -d addons/oca-storage/wheels \
+            --python-version "$WHEEL_PY" --only-binary=:all: --quiet 2>/dev/null; then
+        print_status "Wheels cached in addons/oca-storage/wheels ($(ls addons/oca-storage/wheels | wc -l) packages)"
+    else
+        rm -rf addons/oca-storage/wheels
+        print_warning "Wheel pre-download failed - containers will install from PyPI on first boot"
+    fi
+else
+    print_warning "No host pip found - containers will install from PyPI on first boot"
+fi
+
 # Clean up temp directories
 rm -rf addons/oca-temp-server-env addons/oca-temp-storage addons/oca-temp-cloud-platform
 
@@ -780,6 +804,16 @@ cat >> docker-compose.yml << EOF
       - odoo-network
 
   #=============================================================================
+  # PYTHON USER SITE (named volume is root-owned; odoo is uid 100)
+  #=============================================================================
+  python-user-init:
+    image: ${BUSYBOX_IMAGE}
+    container_name: ${PROJECT_NAME}-python-user-init
+    volumes:
+      - odoo-python:/opt/python-user
+    command: ["sh", "-c", "mkdir -p /opt/python-user && chown -R 100:101 /opt/python-user"]
+
+  #=============================================================================
   # ODOO WEB WORKERS (HTTP TRAFFIC)
   #=============================================================================
   # NOTE: no container_name here - fixed names break 'docker compose up --scale'.
@@ -797,6 +831,8 @@ cat >> docker-compose.yml << EOF
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      python-user-init:
+        condition: service_completed_successfully
     environment:
       HOST: pgbouncer
       PORT: 5432
@@ -813,6 +849,9 @@ cat >> docker-compose.yml << EOF
       ODOO_SESSION_REDIS: 1
       ODOO_SESSION_REDIS_URL: redis://redis:6379/1
       ODOO_SESSION_REDIS_PREFIX: odoo_sess
+      # pip --user lands here, NOT in tmpfs data_dir. Without this, every
+      # restart re-downloads s3fs/redis and nginx 502s until pip finishes.
+      PYTHONUSERBASE: /opt/python-user
     volumes:
       - ./config/odoo/odoo-web.conf:/etc/odoo/odoo.conf:ro
       - ./addons/custom:/mnt/custom-addons:ro
@@ -820,6 +859,7 @@ cat >> docker-compose.yml << EOF
 ${ENTERPRISE_VOLUME_LINE}
       - ./logs/odoo-web:/var/log/odoo:z
       - ./scripts/entrypoint-web.sh:/entrypoint-web.sh:ro
+      - odoo-python:/opt/python-user
     # data_dir in tmpfs: temp files/report artifacts live in RAM and vanish on
     # restart - nothing stateful remains in the container (uid 100 = odoo).
     tmpfs:
@@ -837,8 +877,8 @@ ${ENTERPRISE_VOLUME_LINE}
       test: ["CMD", "curl", "-f", "http://localhost:8069/web/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 10
+      start_period: 180s
 
   #=============================================================================
   # ODOO CHAT WORKERS (WEBSOCKET/LONGPOLLING)
@@ -856,6 +896,8 @@ ${ENTERPRISE_VOLUME_LINE}
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      python-user-init:
+        condition: service_completed_successfully
     environment:
       HOST: pgbouncer
       PORT: 5432
@@ -871,6 +913,7 @@ ${ENTERPRISE_VOLUME_LINE}
       ODOO_SESSION_REDIS: 1
       ODOO_SESSION_REDIS_URL: redis://redis:6379/1
       ODOO_SESSION_REDIS_PREFIX: odoo_sess
+      PYTHONUSERBASE: /opt/python-user
     volumes:
       - ./config/odoo/odoo-chat.conf:/etc/odoo/odoo.conf:ro
       - ./addons/custom:/mnt/custom-addons:ro
@@ -878,6 +921,7 @@ ${ENTERPRISE_VOLUME_LINE}
 ${ENTERPRISE_VOLUME_LINE}
       - ./logs/odoo-chat:/var/log/odoo:z
       - ./scripts/entrypoint-chat.sh:/entrypoint-chat.sh:ro
+      - odoo-python:/opt/python-user
     tmpfs:
       - /var/lib/odoo:size=1g,uid=100,gid=101,mode=0755
     entrypoint: ["/entrypoint-chat.sh"]
@@ -890,12 +934,13 @@ ${ENTERPRISE_VOLUME_LINE}
     networks:
       - odoo-network
     healthcheck:
-      # /websocket/health exists on all supported versions (16+), bus module
-      test: ["CMD", "curl", "-f", "http://localhost:8072/websocket/health"]
+      # /websocket/health is 404 until a database with bus is installed.
+      # The gevent process answers HTTP on 8072 as soon as it is up (303 on /).
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8072/ || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 10
+      start_period: 180s
 
   #=============================================================================
   # NGINX REVERSE PROXY (INTERNAL - PORT 8080)
@@ -915,7 +960,7 @@ ${ENTERPRISE_VOLUME_LINE}
     networks:
       - odoo-network
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/nginx-health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -936,6 +981,8 @@ volumes:
   minio-data:
     driver: local
   redis-data:
+    driver: local
+  odoo-python:
     driver: local
 EOF
 
@@ -1536,20 +1583,7 @@ http {
         ''      close;
     }
 
-    #---------------------------------------------------------------------------
-    # UPSTREAM DEFINITIONS - LOAD BALANCING
-    #---------------------------------------------------------------------------
-    upstream odoo_web {
-        least_conn;  # Route to least busy worker
-        server odoo-web:8069 max_fails=3 fail_timeout=30s;
-        keepalive ${NGINX_KEEPALIVE};  # Connection pooling to workers
-    }
-
-    upstream odoo_chat {
-        least_conn;
-        server odoo-chat:8072 max_fails=3 fail_timeout=30s;
-        keepalive 16;
-    }
+    resolver 127.0.0.11 valid=10s ipv6=off;
 
     #---------------------------------------------------------------------------
     # SERVER BLOCK - INTERNAL STACK ROUTER
@@ -1573,7 +1607,8 @@ http {
         # WEBSOCKET/LONGPOLLING - ROUTE TO CHAT WORKERS
         #-----------------------------------------------------------------------
         location ${WS_ENDPOINT} {
-            proxy_pass http://odoo_chat;
+            set \$odoo_chat http://odoo-chat:8072;
+            proxy_pass \$odoo_chat;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection \$connection_upgrade;
             proxy_set_header Host \$http_host;
@@ -1587,10 +1622,20 @@ http {
         }
 
         #-----------------------------------------------------------------------
+        # NGINX SELF-HEALTH (does not proxy to Odoo)
+        #-----------------------------------------------------------------------
+        location = /nginx-health {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\\n";
+        }
+
+        #-----------------------------------------------------------------------
         # MAIN LOCATION - ROUTE TO WEB WORKERS
         #-----------------------------------------------------------------------
         location / {
-            proxy_pass http://odoo_web;
+            set \$odoo_web http://odoo-web:8069;
+            proxy_pass \$odoo_web;
             proxy_set_header Host \$http_host;
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -1628,11 +1673,19 @@ done
 
 echo "Database is ready!"
 
-# Install Python dependencies for OCA / session_redis (idempotent)
+# Install Python dependencies for OCA / session_redis (idempotent).
+# Prefer the host-cached wheels (offline, seconds); fall back to PyPI.
 if [ -f "/mnt/oca-storage/requirements.txt" ]; then
     if ! python3 -c "import s3fs, redis" 2>/dev/null; then
         echo "Installing Python dependencies..."
-        pip3 install ${PIP_INSTALL_FLAGS} -r /mnt/oca-storage/requirements.txt
+        if [ -n "\$(ls -A /mnt/oca-storage/wheels 2>/dev/null)" ]; then
+            pip3 install ${PIP_INSTALL_FLAGS} --no-index \\
+                --find-links=/mnt/oca-storage/wheels \\
+                -r /mnt/oca-storage/requirements.txt \\
+            || pip3 install ${PIP_INSTALL_FLAGS} -r /mnt/oca-storage/requirements.txt
+        else
+            pip3 install ${PIP_INSTALL_FLAGS} -r /mnt/oca-storage/requirements.txt
+        fi
         echo "Dependencies installed successfully"
     else
         echo "Dependencies already installed, skipping..."
@@ -1667,7 +1720,14 @@ echo "Database is ready!"
 if [ -f "/mnt/oca-storage/requirements.txt" ]; then
     if ! python3 -c "import s3fs, redis" 2>/dev/null; then
         echo "Installing Python dependencies..."
-        pip3 install ${PIP_INSTALL_FLAGS} -r /mnt/oca-storage/requirements.txt
+        if [ -n "\$(ls -A /mnt/oca-storage/wheels 2>/dev/null)" ]; then
+            pip3 install ${PIP_INSTALL_FLAGS} --no-index \\
+                --find-links=/mnt/oca-storage/wheels \\
+                -r /mnt/oca-storage/requirements.txt \\
+            || pip3 install ${PIP_INSTALL_FLAGS} -r /mnt/oca-storage/requirements.txt
+        else
+            pip3 install ${PIP_INSTALL_FLAGS} -r /mnt/oca-storage/requirements.txt
+        fi
         echo "Dependencies installed successfully"
     else
         echo "Dependencies already installed, skipping..."
@@ -2553,6 +2613,9 @@ logs/
 # Docker volumes
 postgres-data/
 minio-data/
+
+# Python wheels cached at generate time (large binaries)
+addons/oca-storage/wheels/
 
 # Temporary files
 *.log
