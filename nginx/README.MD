@@ -2,7 +2,7 @@
 
 ![Docker](https://img.shields.io/badge/Docker-ready-blue)
 ![Odoo](https://img.shields.io/badge/Odoo-16--19-purple)
-![License](https://img.shields.io/badge/license-AGPL--3.0-green)
+![Licence](https://img.shields.io/badge/licence-AGPL--3.0--or--later-green)
 
 > Deploy multiple Odoo versions simultaneously with Docker Compose, optional Nginx reverse proxy, and automatic system optimization. Zero manual configuration, production-ready in minutes.
 
