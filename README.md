@@ -19,11 +19,13 @@ ship them, publish your changes under the same licence.
 | `quick-deploy/` | `quickdeploy.sh`: older multi-version bootstrap without the proxy. Superseded by `nginx/` run without nginx. | legacy |
 | `diagnose/` | `odoo-diagnose.sh`: read-only checks that show what a slow Odoo is *waiting* on (CPU throttling, I/O, memory limits, locks, DNS, misconfiguration), for Docker and bare metal. | active |
 | `stress-test/` | Locust load test with Odoo-shaped users (back office, tills, visitors, ticket buyers) and a copy-and-neutralise recipe with verification, so it cannot be run against production by accident. | active |
+| `baremetal/` | `install.sh`: Odoo on the host (venv, systemd, PostgreSQL, nginx, backups, Let's Encrypt), sized by the same tuning library; `uninstall.sh` to remove it. Debian/Ubuntu. | active |
+| `docs/` | `performance-notes.md`: what we measured on real deployments and what fixed it. | living |
 | `medical/` | ICD-10 import helper for health-sector Odoo installs. | as is |
 | `tests/` | bats tests for the tuning library and the shellcheck runner. | active |
 
-Planned, in this order: `baremetal/` (venv + systemd + PostgreSQL on the host, same
-tuning library), performance notes from real deployments.
+Planned: a Docker-vs-bare-metal comparison on identical hardware with `stress-test/`,
+a website-shop checkout flow for the load test, Kubernetes.
 
 ## Quick start
 
@@ -37,8 +39,14 @@ bin/odoo-tune
 # Why is an existing Odoo slow while the CPU is idle? (read-only)
 sudo diagnose/odoo-diagnose.sh
 
-# Deploy Odoo 19 with PostgreSQL 18, PgBouncer and nginx (answers the prompts)
+# Deploy Odoo 19 with PostgreSQL 18, PgBouncer and nginx in Docker (answers the prompts)
 cd nginx && ./autodeploy-nginx.sh
+
+# Or on the host itself: venv + systemd + PostgreSQL + nginx
+sudo baremetal/install.sh --config baremetal/site.env --dry-run
+
+# Load-test a neutralised copy, never production
+stress-test/README.md
 ```
 
 Run the scripts from a checkout: they source `lib/tuning.sh` relative to their own
