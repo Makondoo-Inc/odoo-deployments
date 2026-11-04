@@ -1,0 +1,48 @@
+#!/bin/bash
+# shellcheck disable=SC2034  # CPU_CORES, TOTAL_RAM_MB, NUM_VERSIONS, USE_PGBOUNCER are read by lib/tuning.sh
+# odoo-tune - print the tuning plan for a machine without deploying anything.
+#
+# Copyright (C) 2025-2026 Makondoo Inc.
+# Licence: AGPL-3.0-or-later
+#
+# Usage:
+#   odoo-tune                              plan for this machine, 1 version, no pooler
+#   odoo-tune --pgbouncer --versions 2     plan for this machine with options
+#   odoo-tune --cores 64 --ram-mb 262144   plan for a machine you do not have
+#   odoo-tune --format env|json            machine-readable output
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/tuning.sh
+source "$SCRIPT_DIR/../lib/tuning.sh"
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+FORMAT=text
+NUM_VERSIONS=1
+USE_PGBOUNCER=false
+ARG_CORES=""
+ARG_RAM_MB=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --cores) ARG_CORES=$2; shift 2 ;;
+        --ram-mb) ARG_RAM_MB=$2; shift 2 ;;
+        --versions) NUM_VERSIONS=$2; shift 2 ;;
+        --pgbouncer) USE_PGBOUNCER=true; shift ;;
+        --no-pgbouncer) USE_PGBOUNCER=false; shift ;;
+        --format) FORMAT=$2; shift 2 ;;
+        -h|--help) usage 0 ;;
+        *) echo "unknown option: $1" >&2; usage 2 ;;
+    esac
+done
+
+# This machine supplies whatever was not given on the command line.
+odoo_tuning_detect
+[ -n "$ARG_CORES" ] && CPU_CORES=$ARG_CORES
+[ -n "$ARG_RAM_MB" ] && TOTAL_RAM_MB=$ARG_RAM_MB
+for n in "$CPU_CORES" "$TOTAL_RAM_MB" "$NUM_VERSIONS"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "numbers only: cores=$CPU_CORES ram-mb=$TOTAL_RAM_MB versions=$NUM_VERSIONS" >&2; exit 2; }
+done
+
+odoo_tuning_compute
+odoo_tuning_print "$FORMAT"
