@@ -16,8 +16,8 @@
 #
 # Usage: ./autodeploy-nginx.sh
 #
-# Author: Community-driven
-# License: MIT
+# Copyright (C) 2025-2026 Makondoo Inc.
+# Licence: AGPL-3.0-or-later
 
 set -e
 set -o pipefail
@@ -872,7 +872,6 @@ fi
 
 # Create config files and entrypoints for each version
 for version in "${VALID_VERSIONS[@]}"; do
-    PORT=$((8066 + version - 16))
 
     # Build addons path based on edition
     if [ "$ODOO_EDITION" = "enterprise" ]; then

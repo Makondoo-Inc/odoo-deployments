@@ -57,8 +57,8 @@
 #
 # Target: 4-64 cores, scales to 128 cores with documented modifications
 #
-# Author: ghoat-debug
-# License: MIT
+# Copyright (C) 2025-2026 Makondoo Inc. (author: ghoat-debug)
+# Licence: AGPL-3.0-or-later
 #===============================================================================
 
 set -e
@@ -221,6 +221,7 @@ detect_system_resources() {
     # Internal nginx scaling
     NGINX_WORKER_CONNECTIONS=$(clamp $((TOTAL_CORES * 1024)) 2048 8192)
     NGINX_RLIMIT_NOFILE=$((NGINX_WORKER_CONNECTIONS * 2))
+    # shellcheck disable=SC2034  # kept for the nginx template, not wired yet
     NGINX_KEEPALIVE=$(clamp $((ACTUAL_HTTP_WORKERS * 2)) 16 64)
 
     print_success "Calculated Configuration:"
