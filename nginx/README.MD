@@ -90,7 +90,7 @@ Manual Odoo deployments are time-consuming and error-prone. This script eliminat
 ## Features
 
 ### Core Features
-- Multi-version Odoo deployment (16, 17, 18, 19)
+- Multi-version Odoo deployment (16, 17, 18, 19, 20)
 - Community and Enterprise edition support
 - Docker Compose orchestration with health checks
 - SELinux-compatible volume mounts (`:Z` flags)
@@ -163,7 +163,6 @@ Manual Odoo deployments are time-consuming and error-prone. This script eliminat
 ### Software Dependencies
 - `bash` 4.0+
 - `docker` and `docker compose`
-- `bc` (for calculations)
 - `nc` or `netstat` (for port checking)
 - `free`, `nproc` (usually pre-installed)
 
@@ -171,30 +170,43 @@ Manual Odoo deployments are time-consuming and error-prone. This script eliminat
 
 ## Quick Start
 
-### 1. Download the Script
+### 1. Get the repository
 
 ```bash
-# Clone the repository
 git clone https://github.com/Makondoo-Inc/odoo-deployments.git
-cd odoo-multi-deploy
-
-# Or download directly
-wget https://raw.githubusercontent.com/Makondoo-Inc/odoo-deployments/refs/heads/main/nginx/autodeploy-%E2%80%8Bnginx.%E2%80%8Bsh
-chmod +x autodeploy-nginx.sh
+cd odoo-deployments/nginx
 ```
+
+Run the script from the checkout: it sources `../lib/tuning.sh`, the tuning
+maths shared with the other deployment modes.
 
 ### 2. Run the Deployment Script
 
 ```bash
-./autodeploy-nginx.sh
+./autodeploy-nginx.sh                       # answer the prompts
+./autodeploy-nginx.sh --config site.env     # settings from a file, prompts for the rest
+./autodeploy-nginx.sh --config site.env --yes   # no prompts: defaults for anything unset
+./autodeploy-nginx.sh --config site.env --dry-run  # print settings + tuning plan, create nothing
 ```
+
+Settings are plain `KEY=VALUE` lines; `deploy.env.example` lists them all.
+The same names work as environment variables, so a one-off deploy is:
+
+```bash
+PROJECT_NAME=shop ODOO_VERSIONS=19 USE_NGINX=true DOMAIN_MODE=custom DOMAIN=shop.example.com \
+  ./autodeploy-nginx.sh --yes
+```
+
+With `--yes` an existing project directory is never deleted unless
+`OVERWRITE=true` is set, and a generated master password is written to
+`{VERSION}-config/odoo.conf` instead of being echoed.
 
 ### 3. Interactive Prompts
 
 The script will ask:
 - **Project name**: Alphanumeric identifier (e.g., `my-odoo`)
 - **Edition**: Community (1) or Enterprise (2)
-- **Versions**: Comma-separated (default: 16,17,18,19)
+- **Versions**: Comma-separated, 16 to 20 (default: 16,17,18,19)
 - **Nginx proxy**: Yes (y) or No (n)
 - **Domain configuration**: sslip.io (1), localhost (2), or custom (3)
 - **Ports**: Nginx port (default: 80) or Odoo starting port (default: 8069)
