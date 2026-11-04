@@ -18,12 +18,12 @@ ship them, publish your changes under the same licence.
 | `stateless/` | `autodeploy-stateless.sh`: horizontally scalable variant (PgBouncer, MinIO filestore, Redis sessions, separate chat workers). | experimental |
 | `quick-deploy/` | `quickdeploy.sh`: older multi-version bootstrap without the proxy. Superseded by `nginx/` run without nginx. | legacy |
 | `diagnose/` | `odoo-diagnose.sh`: read-only checks that show what a slow Odoo is *waiting* on (CPU throttling, I/O, memory limits, locks, DNS, misconfiguration), for Docker and bare metal. | active |
+| `stress-test/` | Locust load test with Odoo-shaped users (back office, tills, visitors, ticket buyers) and a copy-and-neutralise recipe with verification, so it cannot be run against production by accident. | active |
 | `medical/` | ICD-10 import helper for health-sector Odoo installs. | as is |
 | `tests/` | bats tests for the tuning library and the shellcheck runner. | active |
 
-Planned, in this order: `stress-test/` (Locust-based load test with a safe
-copy-and-neutralise recipe), `baremetal/` (venv + systemd + PostgreSQL on the host,
-same tuning library), performance notes from real deployments.
+Planned, in this order: `baremetal/` (venv + systemd + PostgreSQL on the host, same
+tuning library), performance notes from real deployments.
 
 ## Quick start
 
