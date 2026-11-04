@@ -301,7 +301,7 @@ if [ -n "$PG_CMD" ] && psq "select 1" | grep -q 1; then
     done
     if [ -n "$pss_db" ]; then
         info "slowest statements by total time (pg_stat_statements in ${pss_db}):"
-        timeout 20 ${PG_CMD/-d postgres/-d "$pss_db"} -X -q -t -A -c "select round(total_exec_time/1000)||'s '||calls||'x '||round(mean_exec_time)||'ms  '||left(regexp_replace(query,'\s+',' ','g'),90) from pg_stat_statements where query not ilike '%pg_stat%' order by total_exec_time desc limit 5" 2>/dev/null | sed 's/^/         /'
+        timeout 20 ${PG_CMD/-d postgres/-d "$pss_db"} -X -q -t -A -c "select round(total_exec_time/1000)||'s '||calls||'x '||round(mean_exec_time)||'ms  '||left(regexp_replace(query,'\s+',' ','g'),90) from pg_stat_statements where dbid = (select oid from pg_database where datname = current_database()) and query not ilike '%pg_stat%' order by total_exec_time desc limit 5" 2>/dev/null | sed 's/^/         /'
     else info "pg_stat_statements not installed in any database: no per-query evidence (CREATE EXTENSION pg_stat_statements in the Odoo database)"; fi
 else
     skip "no PostgreSQL access (give --pg-cmd, e.g. \"docker exec -i db psql -U odoo -d postgres\" or run with sudo on a bare-metal host)"

@@ -17,13 +17,13 @@ ship them, publish your changes under the same licence.
 | `nginx/` | `autodeploy-nginx.sh`: Docker Compose deployment of one or more Odoo versions with tuned PostgreSQL 18, optional PgBouncer and optional nginx reverse proxy. **Start here.** | active |
 | `stateless/` | `autodeploy-stateless.sh`: horizontally scalable variant (PgBouncer, MinIO filestore, Redis sessions, separate chat workers). | experimental |
 | `quick-deploy/` | `quickdeploy.sh`: older multi-version bootstrap without the proxy. Superseded by `nginx/` run without nginx. | legacy |
+| `diagnose/` | `odoo-diagnose.sh`: read-only checks that show what a slow Odoo is *waiting* on (CPU throttling, I/O, memory limits, locks, DNS, misconfiguration), for Docker and bare metal. | active |
 | `medical/` | ICD-10 import helper for health-sector Odoo installs. | as is |
 | `tests/` | bats tests for the tuning library and the shellcheck runner. | active |
 
-Planned, in this order: non-interactive mode for `nginx/` (config file + flags),
-`diagnose/` (why is Odoo slow while the CPU is idle), `stress-test/` (Locust-based
-load test with a safe copy-and-neutralise recipe), `baremetal/` (venv + systemd +
-PostgreSQL on the host, same tuning library), CI with shellcheck and bats.
+Planned, in this order: `stress-test/` (Locust-based load test with a safe
+copy-and-neutralise recipe), `baremetal/` (venv + systemd + PostgreSQL on the host,
+same tuning library), performance notes from real deployments.
 
 ## Quick start
 
@@ -33,6 +33,9 @@ cd odoo-deployments
 
 # See what the tuning maths would do on this machine (nothing is installed)
 bin/odoo-tune
+
+# Why is an existing Odoo slow while the CPU is idle? (read-only)
+sudo diagnose/odoo-diagnose.sh
 
 # Deploy Odoo 19 with PostgreSQL 18, PgBouncer and nginx (answers the prompts)
 cd nginx && ./autodeploy-nginx.sh
