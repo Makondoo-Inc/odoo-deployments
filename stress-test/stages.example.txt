@@ -1,0 +1,11 @@
+# label backend pos browser buyer minutes
+# Online visitors double at each step with one in five buying; 10 staff and
+# 3 tills in the background. run.sh stops at the first stage that fails more
+# than STOP_RATIO of its requests.
+SMOKE 2 1 2 1 1
+C0025 10 3 20 5 5
+C0050 10 3 40 10 5
+C0100 10 3 80 20 5
+C0200 10 3 160 40 5
+C0400 10 3 320 80 5
+C0800 10 3 640 160 5

@@ -6,7 +6,7 @@
 # Supports host-based routing with wildcard DNS (sslip.io) for zero-configuration local development.
 #
 # Features:
-# - Multi-version Odoo deployment (16, 17, 18, 19)
+# - Multi-version Odoo deployment (16, 17, 18, 19, 20)
 # - Optional Nginx reverse proxy with host-based routing
 # - Wildcard DNS support (sslip.io) - no /etc/hosts editing required
 # - Auto-configured PostgreSQL 18 (default) with performance tuning + async I/O
@@ -14,10 +14,17 @@
 # - SELinux-compatible volume mounts
 # - Custom entrypoints with proper configuration loading
 #
-# Usage: ./autodeploy-nginx.sh
+# Usage:
+#   ./autodeploy-nginx.sh                      answer the prompts
+#   ./autodeploy-nginx.sh --config site.env    settings from a file, prompt for the rest
+#   ./autodeploy-nginx.sh --config site.env --yes
+#                                               no prompts: defaults for anything unset
+#   ./autodeploy-nginx.sh --dry-run [...]      print the settings and tuning plan only
+# Settings are plain KEY=VALUE (see deploy.env.example); environment variables
+# with the same names work too.
 #
-# Author: Community-driven
-# License: MIT
+# Copyright (C) 2025-2026 Makondoo Inc.
+# Licence: AGPL-3.0-or-later
 
 set -e
 set -o pipefail
@@ -38,29 +45,89 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 print_input() { echo -e "${BLUE}[INPUT]${NC} $1"; }
 
+# The tuning maths lives in lib/tuning.sh, shared with the other deployment
+# modes and covered by tests/tuning.bats. Run this script from a checkout.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TUNING_LIB="$SCRIPT_DIR/../lib/tuning.sh"
+if [ ! -f "$TUNING_LIB" ]; then
+    print_error "lib/tuning.sh not found next to this script - run it from a checkout of the repository"
+    exit 1
+fi
+# shellcheck source=../lib/tuning.sh
+source "$TUNING_LIB"
+
+# ---------------------------------------------------------------------------
+# Settings: command line -> config file / environment -> prompt -> default
+# ---------------------------------------------------------------------------
+ASSUME_YES=false
+DRY_RUN=false
+CONFIG_FILE=""
+usage() {
+    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config|-c) CONFIG_FILE=$2; shift 2 ;;
+        --yes|-y) ASSUME_YES=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage 0 ;;
+        *) print_error "Unknown option: $1"; usage 2 ;;
+    esac
+done
+if [ -n "$CONFIG_FILE" ]; then
+    [ -f "$CONFIG_FILE" ] || { print_error "Config file not found: $CONFIG_FILE"; exit 1; }
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# ask VAR "prompt" default: keeps VAR if already set (config/environment),
+# takes the default with --yes, otherwise asks.
+ask() {
+    local var=$1 prompt=$2 def=$3 answer
+    [ -n "${!var:-}" ] && return 0
+    if [ "$ASSUME_YES" = true ]; then
+        printf -v "$var" '%s' "$def"
+        return 0
+    fi
+    print_input "$prompt"
+    read -r answer
+    printf -v "$var" '%s' "${answer:-$def}"
+}
+ask_secret() {
+    local var=$1 prompt=$2 answer
+    [ -n "${!var:-}" ] && return 0
+    [ "$ASSUME_YES" = true ] && return 0
+    print_input "$prompt"
+    read -rs answer
+    echo
+    printf -v "$var" '%s' "$answer"
+}
+# yes_no VALUE: normalises y/yes/true/1 to "true", everything else to "false"
+yes_no() { [[ "$1" =~ ^([Yy]([Ee][Ss])?|[Tt][Rr][Uu][Ee]|1)$ ]] && echo true || echo false; }
+
 # Welcome (clear fails on dumb/absent TERM, e.g. when piped - never fatal)
-clear 2>/dev/null || true
+if [ "$ASSUME_YES" = false ]; then clear 2>/dev/null || true; fi
 echo -e "${CYAN}Odoo Multi-Version Deployment Script${NC}"
 echo -e "${CYAN}Production-ready with optional Nginx reverse proxy${NC}"
 echo
 
-# Get project name
-print_input "Project name:"
-read -r PROJECT_NAME
-
-# Sanitize
+# Project name
+ask PROJECT_NAME "Project name:" ""
 PROJECT_NAME=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
-
 if [[ -z "$PROJECT_NAME" ]]; then
-    print_error "Project name cannot be empty!"
+    print_error "Project name cannot be empty (PROJECT_NAME)"
     exit 1
 fi
 
-# Check existing
-if [ -d "$PROJECT_NAME" ]; then
-    print_warning "Directory exists. Overwrite? (y/N):"
-    read -r OVERWRITE
-    [[ ! "$OVERWRITE" =~ ^[Yy]$ ]] && exit 0
+# Existing directory: never deleted without an explicit yes
+if [ -d "$PROJECT_NAME" ] && [ "$DRY_RUN" = false ]; then
+    if [ "$ASSUME_YES" = true ]; then
+        [ "$(yes_no "${OVERWRITE:-false}")" = true ] || { print_error "Directory ${PROJECT_NAME} exists (set OVERWRITE=true to replace it)"; exit 1; }
+    else
+        ask OVERWRITE "Directory exists. Overwrite? (y/N):" "n"
+        [ "$(yes_no "$OVERWRITE")" = true ] || exit 0
+    fi
     rm -rf "$PROJECT_NAME"
 fi
 
@@ -82,129 +149,163 @@ check_port() {
     fi
 }
 
-# Edition selection
-print_input "Edition? (1) Community (2) Enterprise [1]:"
-read -r EDITION_CHOICE
-ODOO_EDITION=$([[ "$EDITION_CHOICE" == "2" ]] && echo "enterprise" || echo "community")
+# Edition
+if [ -z "${ODOO_EDITION:-}" ]; then
+    ask EDITION_CHOICE "Edition? (1) Community (2) Enterprise [1]:" "1"
+    ODOO_EDITION=$([[ "$EDITION_CHOICE" == "2" ]] && echo "enterprise" || echo "community")
+fi
+case "$ODOO_EDITION" in community|enterprise) ;; *) print_error "ODOO_EDITION must be community or enterprise"; exit 1 ;; esac
 
 # Versions
-print_input "Versions (comma-separated) [16,17,18,19]:"
-read -r VERSIONS_INPUT
-[[ -z "$VERSIONS_INPUT" ]] && VERSIONS_INPUT="16,17,18,19"
-
-# Parse and validate versions immediately
-IFS=',' read -ra VERSIONS <<< "$VERSIONS_INPUT"
+ask ODOO_VERSIONS "Versions (comma-separated) [16,17,18,19]:" "16,17,18,19"
+IFS=',' read -ra VERSIONS <<< "$ODOO_VERSIONS"
 VALID_VERSIONS=()
 for version in "${VERSIONS[@]}"; do
     version=$(echo "$version" | tr -d ' ')
-    if [[ "$version" =~ ^1[5-9]$ ]]; then
+    if [[ "$version" =~ ^(1[5-9]|20)$ ]]; then
         VALID_VERSIONS+=("$version")
+    else
+        print_warning "Ignoring unsupported version '${version}' (15-20 are supported)"
     fi
 done
-
 if [ ${#VALID_VERSIONS[@]} -eq 0 ]; then
     print_error "No valid versions!"
     exit 1
 fi
-
 print_success "Valid versions: ${VALID_VERSIONS[*]}"
 
 # Odoo master password
-print_input "Odoo master password (leave empty for random):"
-read -rs ADMIN_PASSWD
-echo
-if [[ -z "$ADMIN_PASSWD" ]]; then
+ask_secret ADMIN_PASSWD "Odoo master password (leave empty for random):"
+if [[ -z "${ADMIN_PASSWD:-}" ]]; then
     ADMIN_PASSWD=$(openssl rand -base64 32)
-    print_warning "Generated random password: ${ADMIN_PASSWD}"
-    print_warning "Save this password securely!"
+    if [ "$ASSUME_YES" = true ]; then
+        print_warning "Generated a random master password: see {VERSION}-config/odoo.conf (admin_passwd)"
+    else
+        print_warning "Generated random password: ${ADMIN_PASSWD}"
+        print_warning "Save this password securely!"
+    fi
 fi
 
 # Python requirements strategy
-print_header "Python Requirements Strategy"
-echo "1) Install at container start (flexible: edit requirements.txt + restart)"
-echo "2) Bake custom image (faster restarts, no internet needed at runtime,"
-echo "   update via './manage.sh rebuild' - same feel as 'docker compose pull')"
-print_input "Select option [1]:"
-read -r BAKE_CHOICE
-BAKE_IMAGE=$([[ "$BAKE_CHOICE" == "2" ]] && echo "true" || echo "false")
+if [ -z "${BAKE_IMAGE:-}" ]; then
+    print_header "Python Requirements Strategy"
+    echo "1) Install at container start (flexible: edit requirements.txt + restart)"
+    echo "2) Bake custom image (faster restarts, no internet needed at runtime,"
+    echo "   update via './manage.sh rebuild' - same feel as 'docker compose pull')"
+    ask BAKE_CHOICE "Select option [1]:" "1"
+    BAKE_IMAGE=$([[ "$BAKE_CHOICE" == "2" ]] && echo "true" || echo "false")
+fi
+BAKE_IMAGE=$(yes_no "$BAKE_IMAGE")
 if [[ "$BAKE_IMAGE" == "true" ]]; then
     print_success "Baking custom images - edit {VERSION}-build/requirements.txt then './manage.sh rebuild VERSION'"
 else
     print_success "Installing requirements at container start - edit {VERSION}-config/requirements.txt then restart"
 fi
 
-# Nginx option - ASK FIRST
-print_input "Include Nginx proxy? (y/N):"
-read -r NGINX_CHOICE
-USE_NGINX=$([[ "$NGINX_CHOICE" =~ ^[Yy]$ ]] && echo "true" || echo "false")
+# Nginx
+ask USE_NGINX "Include Nginx proxy? (y/N):" "n"
+USE_NGINX=$(yes_no "$USE_NGINX")
 
 if [[ "$USE_NGINX" == "true" ]]; then
-    print_input "Nginx listening port [80]:"
-    read -r NGINX_PORT
-    [[ -z "$NGINX_PORT" ]] && NGINX_PORT=80
-
+    ask NGINX_PORT "Nginx listening port [80]:" "80"
     if ! [[ "$NGINX_PORT" =~ ^[0-9]+$ ]]; then
         print_error "Nginx port must be a number!"
         exit 1
     fi
-    
-    print_header "Domain Configuration"
-    echo "1) Use 127-0-0-1.sslip.io (wildcard DNS, no /etc/hosts needed) [RECOMMENDED for testing]"
-    echo "2) Use localhost (local testing)"
-    echo "3) Custom domain(s) - you specify EXACT domain for each version"
-    print_input "Select option [1]:"
-    read -r DOMAIN_CHOICE
-    [[ -z "$DOMAIN_CHOICE" ]] && DOMAIN_CHOICE=1
-    
-    case "$DOMAIN_CHOICE" in
-        1)
+
+    if [ -z "${DOMAIN_MODE:-}" ]; then
+        print_header "Domain Configuration"
+        echo "1) Use 127-0-0-1.sslip.io (wildcard DNS, no /etc/hosts needed) [RECOMMENDED for testing]"
+        echo "2) Use localhost (local testing)"
+        echo "3) Custom domain(s) - you specify EXACT domain for each version"
+        ask DOMAIN_CHOICE "Select option [1]:" "1"
+        case "$DOMAIN_CHOICE" in
+            2) DOMAIN_MODE="localhost" ;;
+            3) DOMAIN_MODE="custom" ;;
+            *) DOMAIN_MODE="sslip" ;;
+        esac
+    fi
+
+    declare -A CUSTOM_DOMAINS
+    case "$DOMAIN_MODE" in
+        sslip)
             BASE_DOMAIN="127-0-0-1.sslip.io"
             DOMAIN_MODE="auto"
             print_success "Using sslip.io - access at http://127-0-0-1.sslip.io:${NGINX_PORT}"
             ;;
-        2)
+        localhost)
             BASE_DOMAIN="localhost"
             DOMAIN_MODE="auto"
             print_success "Using localhost - access at http://localhost:${NGINX_PORT}"
             ;;
-        3)
-            DOMAIN_MODE="custom"
-            declare -A CUSTOM_DOMAINS
-            
+        custom)
+            # DOMAIN for a single version, or DOMAIN_<version> per version
             if [ ${#VALID_VERSIONS[@]} -eq 1 ]; then
-                print_input "Enter your domain (e.g., portal.yourdomain.com):"
-                read -r CUSTOM_DOMAIN
-                [[ -z "$CUSTOM_DOMAIN" ]] && CUSTOM_DOMAIN="localhost"
-                CUSTOM_DOMAINS[${VALID_VERSIONS[0]}]="$CUSTOM_DOMAIN"
-                print_success "Odoo ${VALID_VERSIONS[0]} will be accessible at: http://${CUSTOM_DOMAIN}:${NGINX_PORT}"
+                v=${VALID_VERSIONS[0]}
+                per_version="DOMAIN_${v}"
+                [ -n "${!per_version:-}" ] && DOMAIN=${!per_version}
+                ask DOMAIN "Enter your domain (e.g., portal.yourdomain.com):" "localhost"
+                CUSTOM_DOMAINS[$v]="$DOMAIN"
+                print_success "Odoo ${v} will be accessible at: http://${DOMAIN}:${NGINX_PORT}"
             else
                 echo ""
                 print_status "Enter domain for each Odoo version:"
                 for version in "${VALID_VERSIONS[@]}"; do
-                    print_input "Domain for Odoo ${version} (e.g., portal.client1.com):"
-                    read -r CUSTOM_DOMAIN
-                    [[ -z "$CUSTOM_DOMAIN" ]] && CUSTOM_DOMAIN="odoo${version}.localhost"
-                    CUSTOM_DOMAINS[$version]="$CUSTOM_DOMAIN"
-                    print_success "Odoo ${version} → http://${CUSTOM_DOMAIN}:${NGINX_PORT}"
+                    per_version="DOMAIN_${version}"
+                    ask "$per_version" "Domain for Odoo ${version} (e.g., portal.client1.com):" "odoo${version}.localhost"
+                    CUSTOM_DOMAINS[$version]="${!per_version}"
+                    print_success "Odoo ${version} → http://${!per_version}:${NGINX_PORT}"
                 done
             fi
             ;;
+        *) print_error "DOMAIN_MODE must be sslip, localhost or custom"; exit 1 ;;
     esac
-    
+
     BASE_PORT=0  # Flag to indicate no direct host port mapping
 else
     # Only ask for Odoo ports if NOT using Nginx
-    print_input "Starting host port for Odoo instances [8069]:"
-    read -r BASE_PORT
-    [[ -z "$BASE_PORT" ]] && BASE_PORT=8069
-
-    # Validate port is numeric
+    ask BASE_PORT "Starting host port for Odoo instances [8069]:" "8069"
     if ! [[ "$BASE_PORT" =~ ^[0-9]+$ ]]; then
         print_error "Port must be a number!"
         exit 1
     fi
     BASE_DOMAIN="localhost"
 fi
+
+# Default to PostgreSQL 18 for all Odoo versions: PG18 is compatibility-safe
+# for Odoo's ORM-generated SQL and brings the async-I/O subsystem (io_method/
+# io_workers) plus pg_stat_io byte-level stats. Older PG remains an explicit
+# opt-down (e.g. to match an existing production DB).
+PG_VERSION_DEFAULT="18"
+ask PG_VERSION "PostgreSQL version [${PG_VERSION_DEFAULT}]:" "$PG_VERSION_DEFAULT"
+if ! [[ "$PG_VERSION" =~ ^[0-9]+$ ]] || [ "$PG_VERSION" -lt 13 ]; then
+    print_error "PostgreSQL version must be a number >= 13 (Odoo 16+ requires PG 13+)"
+    exit 1
+fi
+if [ "$PG_VERSION" != "$PG_VERSION_DEFAULT" ]; then
+    print_warning "Using PostgreSQL ${PG_VERSION} (recommended for your Odoo versions: ${PG_VERSION_DEFAULT})"
+fi
+
+# Optional PgBouncer connection pooler
+if [ -z "${USE_PGBOUNCER:-}" ]; then
+    print_header "Connection Pooling (PgBouncer)"
+    echo "PgBouncer multiplexes all Odoo connections onto a small pool of postgres"
+    echo "backends. Worker counts stop being limited by max_connections entirely,"
+    echo "and connection storms are absorbed by the pooler instead of postgres."
+    echo "Odoo's websocket bus (LISTEN/NOTIFY on the 'postgres' DB) is routed in"
+    echo "session mode automatically, so realtime chat/notifications keep working."
+    ask PGB_CHOICE "Add PgBouncer connection pooler? (Y/n):" "y"
+    USE_PGBOUNCER=$([[ "$PGB_CHOICE" =~ ^[Nn] ]] && echo "false" || echo "true")
+fi
+USE_PGBOUNCER=$(yes_no "$USE_PGBOUNCER")
+if [[ "$USE_PGBOUNCER" == "true" ]]; then
+    print_success "PgBouncer enabled - transaction pooling with session-mode bus routing"
+else
+    print_status "No pooler - Odoo connects to postgres directly (worker count stays connection-budgeted)"
+fi
+
+# Container timezone
+TIMEZONE=${TIMEZONE:-Africa/Nairobi}
 
 if [[ "$USE_NGINX" == "true" ]]; then
     print_status "Creating: ${PROJECT_NAME} with versions ${VALID_VERSIONS[*]} (${ODOO_EDITION}) + Nginx on port ${NGINX_PORT}"
@@ -216,6 +317,51 @@ if [[ "$USE_NGINX" == "true" ]]; then
 else
     print_status "Creating: ${PROJECT_NAME} with versions ${VALID_VERSIONS[*]} (${ODOO_EDITION})"
     print_status "Odoo instances will be directly accessible starting from port ${BASE_PORT}"
+fi
+
+# The postgres:18+ image moved its volume to /var/lib/postgresql; the old
+# /var/lib/postgresql/data layout leaves a stray anonymous volume there.
+if [ "$PG_VERSION" -ge 18 ]; then
+    PG_VOLUME_MOUNT="db-data:/var/lib/postgresql:Z"
+    PG_DATA_ENV=""
+else
+    PG_VOLUME_MOUNT="db-data:/var/lib/postgresql/data:Z"
+    PG_DATA_ENV="PGDATA: /var/lib/postgresql/data/pgdata"
+fi
+
+# ============================================================================
+# Resource detection & tuning math - SINGLE SOURCE OF TRUTH: ../lib/tuning.sh
+# Every generated config (postgresql.conf, odoo.conf, docker-compose shm_size,
+# nginx.conf, pgbouncer.ini, performance-tuner.sh) derives from the values it
+# computes, so the whole stack scales together, from a 2-core VPS to a
+# 256-core server. bin/odoo-tune prints the same plan without deploying.
+# ============================================================================
+odoo_tuning_detect
+# Test hook: pretend to be another machine (used by tests/nginx.bats)
+[ -n "${ODOO_TUNE_CORES:-}" ] && CPU_CORES=$ODOO_TUNE_CORES
+[ -n "${ODOO_TUNE_RAM_MB:-}" ] && TOTAL_RAM_MB=$ODOO_TUNE_RAM_MB
+NUM_VERSIONS=${#VALID_VERSIONS[@]}
+tuning_warn() { print_warning "$1"; }
+odoo_tuning_compute
+
+print_status "Detected ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} Odoo version(s)"
+print_status "Tuning: ${OPTIMAL_WORKERS} workers/version, db_maxconn=${DB_MAXCONN}, pg max_connections=${MAX_CONNECTIONS}, work_mem=${WORK_MEM}MB"
+
+if [ "$DRY_RUN" = true ]; then
+    print_header "Dry run - nothing created"
+    echo "PROJECT_NAME=${PROJECT_NAME}"
+    echo "ODOO_EDITION=${ODOO_EDITION}"
+    echo "ODOO_VERSIONS=${VALID_VERSIONS[*]}"
+    echo "BAKE_IMAGE=${BAKE_IMAGE}"
+    echo "USE_NGINX=${USE_NGINX}"
+    [ "$USE_NGINX" = true ] && echo "NGINX_PORT=${NGINX_PORT} DOMAIN_MODE=${DOMAIN_MODE} DOMAINS=${BASE_DOMAIN:-}${CUSTOM_DOMAINS[*]:-}"
+    [ "$USE_NGINX" = false ] && echo "BASE_PORT=${BASE_PORT}"
+    echo "PG_VERSION=${PG_VERSION}"
+    echo "USE_PGBOUNCER=${USE_PGBOUNCER}"
+    echo "TIMEZONE=${TIMEZONE}"
+    echo
+    odoo_tuning_print
+    exit 0
 fi
 
 # Create project
@@ -234,216 +380,6 @@ for version in "${VALID_VERSIONS[@]}"; do
     fi
 done
 
-# Default to PostgreSQL 18 for all Odoo versions: PG18 is compatibility-safe
-# for Odoo's ORM-generated SQL and brings the async-I/O subsystem (io_method/
-# io_workers) plus pg_stat_io byte-level stats. Older PG remains an explicit
-# opt-down at the prompt below (e.g. to match an existing production DB).
-PG_VERSION_DEFAULT="18"
-
-# Let the deployer pick (e.g. matching an existing production DB for a sandbox clone)
-print_input "PostgreSQL version [${PG_VERSION_DEFAULT}]:"
-read -r PG_VERSION
-[[ -z "$PG_VERSION" ]] && PG_VERSION=$PG_VERSION_DEFAULT
-
-if ! [[ "$PG_VERSION" =~ ^[0-9]+$ ]] || [ "$PG_VERSION" -lt 13 ]; then
-    print_error "PostgreSQL version must be a number >= 13 (Odoo 16+ requires PG 13+)"
-    exit 1
-fi
-
-if [ "$PG_VERSION" != "$PG_VERSION_DEFAULT" ]; then
-    print_warning "Using PostgreSQL ${PG_VERSION} (recommended for your Odoo versions: ${PG_VERSION_DEFAULT})"
-fi
-
-# Optional PgBouncer connection pooler
-print_header "Connection Pooling (PgBouncer)"
-echo "PgBouncer multiplexes all Odoo connections onto a small pool of postgres"
-echo "backends. Worker counts stop being limited by max_connections entirely,"
-echo "and connection storms are absorbed by the pooler instead of postgres."
-echo "Odoo's websocket bus (LISTEN/NOTIFY on the 'postgres' DB) is routed in"
-echo "session mode automatically, so realtime chat/notifications keep working."
-print_input "Add PgBouncer connection pooler? (Y/n):"
-read -r PGB_CHOICE
-USE_PGBOUNCER=$([[ "$PGB_CHOICE" =~ ^[Nn]$ ]] && echo "false" || echo "true")
-if [[ "$USE_PGBOUNCER" == "true" ]]; then
-    print_success "PgBouncer enabled - transaction pooling with session-mode bus routing"
-else
-    print_status "No pooler - Odoo connects to postgres directly (worker count stays connection-budgeted)"
-fi
-
-# The postgres:18+ image moved its volume to /var/lib/postgresql; the old
-# /var/lib/postgresql/data layout leaves a stray anonymous volume there.
-if [ "$PG_VERSION" -ge 18 ]; then
-    PG_VOLUME_MOUNT="db-data:/var/lib/postgresql:Z"
-    PG_DATA_ENV=""
-else
-    PG_VOLUME_MOUNT="db-data:/var/lib/postgresql/data:Z"
-    PG_DATA_ENV="PGDATA: /var/lib/postgresql/data/pgdata"
-fi
-
-# ============================================================================
-# Resource detection & tuning math - SINGLE SOURCE OF TRUTH
-# Every generated config (postgresql.conf, odoo.conf, docker-compose shm_size,
-# nginx.conf, performance-tuner.sh) derives from the values computed here so
-# the whole stack scales together, from 2-core VPS to 256-core bare metal.
-# ============================================================================
-CPU_CORES=$(nproc)
-TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-NUM_VERSIONS=${#VALID_VERSIONS[@]}
-
-# clamp VALUE MIN MAX
-clamp() {
-    local v=$1 lo=$2 hi=$3
-    [ "$v" -lt "$lo" ] && v=$lo
-    [ "$v" -gt "$hi" ] && v=$hi
-    echo "$v"
-}
-
-# --- PostgreSQL memory -------------------------------------------------------
-SHARED_BUFFERS=$((TOTAL_RAM_MB / 4))  # 25% of RAM...
-# ...capped at 16GB: beyond that OLTP workloads like Odoo see diminishing
-# returns and double-buffering waste; the OS page cache (effective_cache_size)
-# covers the rest. huge_pages=try in postgresql.conf avoids TLB thrashing.
-[ "$SHARED_BUFFERS" -gt 16384 ] && SHARED_BUFFERS=16384
-EFFECTIVE_CACHE_SIZE=$((TOTAL_RAM_MB * 3 / 4))  # 75% of RAM
-MAINTENANCE_WORK_MEM=$(clamp $((TOTAL_RAM_MB / 16)) 64 4096)  # ~6% RAM, 4GB cap
-
-# --- Odoo workers per version ------------------------------------------------
-# Worker memory tiers by total RAM
-if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
-    WORKER_MEMORY_MB=512
-    SOFT_LIMIT_MB=400
-elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
-    WORKER_MEMORY_MB=1024
-    SOFT_LIMIT_MB=800
-else
-    WORKER_MEMORY_MB=2048
-    SOFT_LIMIT_MB=1600
-fi
-
-MAX_CRON_THREADS=2
-
-# RAM budget: 80% safety factor, minus a small OS reserve and what postgres
-# itself claims (shared_buffers), split evenly across deployed versions.
-# Workers are planned at their SOFT limit: that is the steady-state footprint
-# (Odoo recycles a worker that exceeds it after the current request), while
-# the hard limit only guards abnormal spikes - sizing at the hard limit would
-# leave half the machine idle.
-available_ram_mb=$(( TOTAL_RAM_MB * 80 / 100 ))
-RESERVED_RAM=$(( 512 + SHARED_BUFFERS ))
-odoo_ram_budget=$(( available_ram_mb - RESERVED_RAM ))
-[ "$odoo_ram_budget" -lt 0 ] && odoo_ram_budget=0
-per_version_ram=$(( odoo_ram_budget / NUM_VERSIONS ))
-max_workers_by_ram=$(( per_version_ram / SOFT_LIMIT_MB ))
-
-# CPU guidance (workers = cores*2+1) is for a dedicated host, so the total is
-# spread across versions (ceiling division) instead of granted to each one.
-max_workers_by_cpu=$(( (CPU_CORES * 2 + 1 + NUM_VERSIONS - 1) / NUM_VERSIONS ))
-
-OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
-# Very low resources: workers=0 runs Odoo single-process threaded mode
-[ "$OPTIMAL_WORKERS" -lt 1 ] && OPTIMAL_WORKERS=0
-
-# --- Connection budget (replaces the old flat max_connections=200 / cap of 8
-# workers, which silently throttled anything bigger than a 4-core box) -------
-if [[ "$USE_PGBOUNCER" == "true" ]]; then
-    # PgBouncer (transaction mode) multiplexes any number of Odoo client
-    # connections onto a small backend pool, so workers stay bounded by
-    # CPU/RAM only. Postgres itself only needs ~4 active backends per core -
-    # more than that just queue on CPU anyway.
-    MAX_CONNECTIONS=$(clamp $(( CPU_CORES * 4 + 20 )) 100 500)
-    # Per database/user pair pool; big reports hold a backend for their whole
-    # transaction, so give each database room to fan out.
-    PGB_DEFAULT_POOL_SIZE=$(clamp $(( CPU_CORES * 2 )) 8 64)
-    # Hard per-database backend cap so one busy database cannot starve others
-    PGB_MAX_DB_CONNECTIONS=$(( MAX_CONNECTIONS - 20 ))
-    # Client side is cheap: every Odoo process may hold up to db_maxconn
-    PGB_MAX_CLIENT_CONN=$(clamp $(( NUM_VERSIONS * (OPTIMAL_WORKERS + MAX_CRON_THREADS + 2) * 16 )) 1000 10000)
-else
-    # Direct connections: peak per version is HTTP workers at ~2 connections
-    # each under load, plus cron threads, plus a gevent/bus + maintenance
-    # allowance.
-    PER_VERSION_CONNS=$(( OPTIMAL_WORKERS * 2 + MAX_CRON_THREADS + 8 ))
-    MAX_CONNECTIONS=$(( PER_VERSION_CONNS * NUM_VERSIONS * 120 / 100 + 10 ))  # +20% headroom +10 reserve
-    [ "$MAX_CONNECTIONS" -lt 100 ] && MAX_CONNECTIONS=100
-    if [ "$MAX_CONNECTIONS" -gt 1000 ]; then
-        # Past ~1000 backends, per-process overhead dominates; clamp and derive
-        # the worker count back from the budget. Enabling PgBouncer removes
-        # this limit entirely.
-        MAX_CONNECTIONS=1000
-        budget_per_version=$(( (MAX_CONNECTIONS - 10) * 100 / 120 / NUM_VERSIONS ))
-        OPTIMAL_WORKERS=$(( (budget_per_version - MAX_CRON_THREADS - 8) / 2 ))
-        print_warning "Worker count limited by 1000-connection budget - enable PgBouncer to go beyond"
-    fi
-fi
-
-# Per-process pool cap in Odoo; scaled to the computed worker count so a
-# single runaway process cannot drain the whole cluster budget.
-DB_MAXCONN=$(clamp $(( OPTIMAL_WORKERS * 2 + 16 )) 64 256)
-
-# --- work_mem: bounded against the connection budget, not just cores --------
-# Worst case is work_mem x concurrent sort/hash ops; dividing non-shared RAM
-# by max_connections keeps a fully loaded box out of OOM territory (the old
-# RAM/(cores*4) formula produced 512MB on a 2-core/4GB box).
-WORK_MEM=$(clamp $(( (TOTAL_RAM_MB - SHARED_BUFFERS) / MAX_CONNECTIONS )) 4 256)
-
-# --- WAL sizing, autovacuum, shared memory by RAM tier -----------------------
-if [ "$TOTAL_RAM_MB" -lt 8192 ]; then
-    MAX_WAL_SIZE="2GB";  MIN_WAL_SIZE="512MB"
-elif [ "$TOTAL_RAM_MB" -lt 32768 ]; then
-    MAX_WAL_SIZE="4GB";  MIN_WAL_SIZE="1GB"
-else
-    MAX_WAL_SIZE="8GB";  MIN_WAL_SIZE="2GB"
-fi
-
-AUTOVACUUM_WORKERS=$(clamp $(( CPU_CORES / 4 )) 3 8)
-
-# --- Parallel query: what actually makes a single huge report fast ----------
-# Postgres defaults cap every query at 2 parallel workers (out of a global
-# pool of 8) no matter how many cores exist. Scale the pool to the machine so
-# big scans/sorts/aggregations fan out across cores.
-MAX_WORKER_PROCESSES=$(clamp "$CPU_CORES" 8 128)
-MAX_PARALLEL_WORKERS=$(clamp "$CPU_CORES" 8 128)
-MAX_PARALLEL_PER_GATHER=$(clamp $(( CPU_CORES / 4 )) 2 8)
-MAX_PARALLEL_MAINTENANCE=$(clamp $(( CPU_CORES / 8 )) 2 4)
-
-if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
-    SHM_SIZE="256mb"
-elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
-    SHM_SIZE="512mb"
-elif [ "$TOTAL_RAM_MB" -lt 32768 ]; then
-    SHM_SIZE="1gb"
-else
-    SHM_SIZE="2gb"
-fi
-
-# --- PostgreSQL 18+ async I/O -----------------------------------------------
-# io_method=worker (async I/O via worker processes) is the PG18 default but is
-# pinned explicitly, with io_workers scaled to CPU instead of the fixed 3.
-# io_uring is NOT used: Docker's default seccomp profile blocks io_uring
-# syscalls, so postgres would fail at startup inside the container.
-IO_WORKERS=$(clamp $(( CPU_CORES / 4 )) 3 32)
-
-# --- Nginx (only used when the embedded proxy is enabled) --------------------
-NGINX_WORKER_CONNECTIONS=$(clamp $(( CPU_CORES * 1024 )) 1024 8192)
-# Each proxied client costs ~2 fds (client + upstream); keep rlimit above that
-NGINX_RLIMIT_NOFILE=$(( NGINX_WORKER_CONNECTIONS * 2 + 512 ))
-NGINX_KEEPALIVE=$(clamp $(( OPTIMAL_WORKERS * 4 )) 32 128)
-NGINX_KEEPALIVE_CHAT=$(( NGINX_KEEPALIVE / 2 ))
-
-# --- Odoo memory limits (bytes) ----------------------------------------------
-HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
-SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
-
-# Where Odoo connects: through the pooler when enabled, else straight to postgres
-if [[ "$USE_PGBOUNCER" == "true" ]]; then
-    ODOO_DB_HOST="pgbouncer"
-else
-    ODOO_DB_HOST="db"
-fi
-
-print_status "Detected ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} Odoo version(s)"
-print_status "Tuning: ${OPTIMAL_WORKERS} workers/version, db_maxconn=${DB_MAXCONN}, pg max_connections=${MAX_CONNECTIONS}, work_mem=${WORK_MEM}MB"
-
 # Generate docker-compose.yml with custom entrypoint
 print_status "Generating docker-compose.yml with custom entrypoint..."
 
@@ -456,7 +392,7 @@ services:
       POSTGRES_USER: odoo
       POSTGRES_PASSWORD: odoo
       POSTGRES_DB: postgres
-      TZ: Africa/Nairobi
+      TZ: ${TIMEZONE}
 EOF
 
 if [ -n "$PG_DATA_ENV" ]; then
@@ -567,7 +503,7 @@ for version in "${VALID_VERSIONS[@]}"; do
       USER: odoo
       PASSWORD: odoo
       ODOO_RC: /etc/odoo/odoo.conf
-      TZ: Africa/Nairobi
+      TZ: ${TIMEZONE}
     volumes:
       - odoo${version}-data:/var/lib/odoo:Z
       - ./${version}-config:/etc/odoo:Z
@@ -627,7 +563,7 @@ EOF
       USER: odoo
       PASSWORD: odoo
       ODOO_RC: /etc/odoo/odoo.conf
-      TZ: Africa/Nairobi
+      TZ: ${TIMEZONE}
     volumes:
       - odoo${version}-data:/var/lib/odoo:Z
       - ./${version}-config:/etc/odoo:Z
@@ -872,7 +808,6 @@ fi
 
 # Create config files and entrypoints for each version
 for version in "${VALID_VERSIONS[@]}"; do
-    PORT=$((8066 + version - 16))
 
     # Build addons path based on edition
     if [ "$ODOO_EDITION" = "enterprise" ]; then
@@ -1056,6 +991,8 @@ esac
 
 exit 1
 ENTRYPOINT_EOF
+
+    sed -i "s|^export TZ=Africa/Nairobi$|export TZ=${TIMEZONE}|" "${version}-config/entrypoint.sh"
 
     # Make entrypoint executable
     chmod +x "${version}-config/entrypoint.sh"
@@ -1678,133 +1615,72 @@ server {
 }
 EOF
 
-# Create performance tuning script.
-# IMPORTANT: this helper mirrors the EXACT formulas used at deploy time (the
-# unified tuning block in autodeploy-nginx.sh). If you change one, change both
-# - a diverging helper recommends configs that disagree with what's deployed.
+# Create the performance tuning helper. It sources conf/tuning.sh, a copy of
+# the repository's lib/tuning.sh taken at deploy time, so it always uses the
+# exact formulas this deployment was sized with.
+cp "$TUNING_LIB" conf/tuning.sh
 cat > conf/performance-tuner.sh << 'EOF'
 #!/bin/bash
 # Odoo Performance Tuning Helper
-# Re-runs the deploy-time tuning math against current hardware and compares
-# with what is actually deployed. Useful after a RAM/CPU upgrade to see what
-# a redeploy would give you.
+# Re-runs the deploy-time tuning math (conf/tuning.sh) against the current
+# hardware and compares it with what is deployed. Useful after a RAM/CPU
+# upgrade to see what a redeploy would give you.
 
 set -e
 
-# Colors
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=/dev/null
+source "$HERE/tuning.sh"
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
-
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+tuning_warn() { print_warning "$1"; }
 
-echo "🚀 Odoo Performance Tuning Helper"
+echo "Odoo Performance Tuning Helper"
 echo
 
-clamp() {
-    local v=$1 lo=$2 hi=$3
-    [ "$v" -lt "$lo" ] && v=$lo
-    [ "$v" -gt "$hi" ] && v=$hi
-    echo "$v"
-}
-
-# Detect system resources
-CPU_CORES=$(nproc)
-TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-
-# Number of deployed Odoo versions sharing this host (from docker-compose.yml)
-COMPOSE_FILE="docker-compose.yml"
-[ -f "$COMPOSE_FILE" ] || COMPOSE_FILE="../docker-compose.yml"
-# grep -c prints the count but exits non-zero on 0 matches; '|| true' keeps
-# set -e happy without corrupting the value
+# Number of deployed Odoo versions sharing this host and whether PgBouncer is
+# in use, both read from the deployed docker-compose.yml
+COMPOSE_FILE="$HERE/../docker-compose.yml"
 NUM_VERSIONS=$(grep -cE '^  odoo[0-9]+:' "$COMPOSE_FILE" 2>/dev/null || true)
 case "$NUM_VERSIONS" in ''|0|*[!0-9]*) NUM_VERSIONS=1 ;; esac
-
-# PgBouncer deployments decouple workers from the postgres connection budget
 USE_PGBOUNCER=false
 grep -qE '^  pgbouncer:' "$COMPOSE_FILE" 2>/dev/null && USE_PGBOUNCER=true
 
-print_info "System Resources Detected:"
-echo "  CPU Cores: $CPU_CORES"
-echo "  Total RAM: ${TOTAL_RAM_MB}MB"
-echo "  Odoo versions sharing host: $NUM_VERSIONS"
-echo "  PgBouncer pooler: $USE_PGBOUNCER"
-echo
+odoo_tuning_detect
+[ -n "${ODOO_TUNE_CORES:-}" ] && CPU_CORES=$ODOO_TUNE_CORES
+[ -n "${ODOO_TUNE_RAM_MB:-}" ] && TOTAL_RAM_MB=$ODOO_TUNE_RAM_MB
+odoo_tuning_compute
 
-# --- Same math as the deploy script ---
-SHARED_BUFFERS=$((TOTAL_RAM_MB / 4))
-[ "$SHARED_BUFFERS" -gt 16384 ] && SHARED_BUFFERS=16384
-
-if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
-    WORKER_MEMORY_MB=512;  SOFT_LIMIT_MB=400
-elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
-    WORKER_MEMORY_MB=1024; SOFT_LIMIT_MB=800
-else
-    WORKER_MEMORY_MB=2048; SOFT_LIMIT_MB=1600
-fi
-
-MAX_CRON_THREADS=2
-available_ram_mb=$(( TOTAL_RAM_MB * 80 / 100 ))
-RESERVED_RAM=$(( 512 + SHARED_BUFFERS ))
-odoo_ram_budget=$(( available_ram_mb - RESERVED_RAM ))
-[ "$odoo_ram_budget" -lt 0 ] && odoo_ram_budget=0
-max_workers_by_ram=$(( odoo_ram_budget / NUM_VERSIONS / SOFT_LIMIT_MB ))
-max_workers_by_cpu=$(( (CPU_CORES * 2 + 1 + NUM_VERSIONS - 1) / NUM_VERSIONS ))
-OPTIMAL_WORKERS=$(( max_workers_by_ram < max_workers_by_cpu ? max_workers_by_ram : max_workers_by_cpu ))
-[ "$OPTIMAL_WORKERS" -lt 1 ] && OPTIMAL_WORKERS=0
-
-if [ "$USE_PGBOUNCER" = "true" ]; then
-    # Pooled: workers bounded by CPU/RAM only
-    MAX_CONNECTIONS=$(clamp $(( CPU_CORES * 4 + 20 )) 100 500)
-else
-    PER_VERSION_CONNS=$(( OPTIMAL_WORKERS * 2 + MAX_CRON_THREADS + 8 ))
-    MAX_CONNECTIONS=$(( PER_VERSION_CONNS * NUM_VERSIONS * 120 / 100 + 10 ))
-    [ "$MAX_CONNECTIONS" -lt 100 ] && MAX_CONNECTIONS=100
-    if [ "$MAX_CONNECTIONS" -gt 1000 ]; then
-        MAX_CONNECTIONS=1000
-        budget_per_version=$(( (MAX_CONNECTIONS - 10) * 100 / 120 / NUM_VERSIONS ))
-        OPTIMAL_WORKERS=$(( (budget_per_version - MAX_CRON_THREADS - 8) / 2 ))
-    fi
-fi
-DB_MAXCONN=$(clamp $(( OPTIMAL_WORKERS * 2 + 16 )) 64 256)
-
-HARD_LIMIT_BYTES=$(( WORKER_MEMORY_MB * 1024 * 1024 ))
-SOFT_LIMIT_BYTES=$(( SOFT_LIMIT_MB * 1024 * 1024 ))
-
-print_info "Recommended per version (deploy-time formula):"
-echo "  RAM limited:  $max_workers_by_ram workers"
-echo "  CPU limited:  $max_workers_by_cpu workers"
-echo "  workers = $OPTIMAL_WORKERS"
-echo "  db_maxconn = $DB_MAXCONN"
-echo "  limit_memory_hard = $HARD_LIMIT_BYTES  # ${WORKER_MEMORY_MB}MB"
-echo "  limit_memory_soft = $SOFT_LIMIT_BYTES  # ${SOFT_LIMIT_MB}MB"
-echo "  (postgres max_connections should be $MAX_CONNECTIONS)"
+print_info "Recommended for this hardware (deploy-time formula):"
+odoo_tuning_print
 echo
 
 # Compare with what is actually deployed
-for conf in [0-9][0-9]-config/odoo.conf ../[0-9][0-9]-config/odoo.conf; do
+for conf in "$HERE"/../[0-9][0-9]-config/odoo.conf; do
     [ -f "$conf" ] || continue
     deployed_workers=$(grep -E '^workers *=' "$conf" | head -1 | tr -d ' ' | cut -d= -f2)
     deployed_maxconn=$(grep -E '^db_maxconn *=' "$conf" | head -1 | tr -d ' ' | cut -d= -f2)
     if [ "$deployed_workers" != "$OPTIMAL_WORKERS" ] || [ "$deployed_maxconn" != "$DB_MAXCONN" ]; then
-        print_warning "$conf: deployed workers=$deployed_workers db_maxconn=$deployed_maxconn differ from recommendation - hardware may have changed since deploy"
+        print_warning "$(basename "$(dirname "$conf")")/odoo.conf: deployed workers=$deployed_workers db_maxconn=$deployed_maxconn differ from the recommendation - hardware may have changed since deploy"
     else
-        print_success "$conf: matches current hardware recommendation"
+        print_success "$(basename "$(dirname "$conf")")/odoo.conf: matches the current hardware recommendation"
     fi
 done
 echo
 
-# Generate config snippet
-cat > performance-config.conf << EOL
+# Generate a config snippet next to docker-compose.yml
+cat > "$HERE/../performance-config.conf" << EOL
 # Generated Performance Configuration (same formula as deploy time)
-# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} version(s)
+# System: ${CPU_CORES} cores, ${TOTAL_RAM_MB}MB RAM, ${NUM_VERSIONS} version(s), pgbouncer=${USE_PGBOUNCER}
 # Generated: $(date)
 
 [options]
-# Performance settings
 workers = $OPTIMAL_WORKERS
 max_cron_threads = $MAX_CRON_THREADS
 limit_memory_hard = $HARD_LIMIT_BYTES
@@ -1814,10 +1690,14 @@ limit_time_cpu = 600
 limit_time_real = 1200
 db_maxconn = $DB_MAXCONN
 
+# PostgreSQL (conf/postgresql/postgresql.conf)
+# max_connections = $MAX_CONNECTIONS
+# shared_buffers = ${SHARED_BUFFERS}MB
+# work_mem = ${WORK_MEM}MB
+
 # For production, also set:
 # proxy_mode = True
 # list_db = False
-# log_level = warn
 EOL
 
 print_success "Configuration saved to: performance-config.conf"
@@ -2551,7 +2431,7 @@ if [[ "$USE_NGINX" == "true" ]]; then
         echo
         print_warning "Ensure DNS records point to your server IP:"
         for version in "${VALID_VERSIONS[@]}"; do
-            echo "  ${CUSTOM_DOMAINS[$version]} → $(hostname -I | awk '{print $1}')"
+            echo "  ${CUSTOM_DOMAINS[$version]} → $(hostname -I 2>/dev/null || hostname -i 2>/dev/null || echo '<server IP>')"
         done
     else
         if [ ${#VALID_VERSIONS[@]} -eq 1 ]; then

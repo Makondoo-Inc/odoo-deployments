@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (C) 2025-2026 Makondoo Inc. Licence: AGPL-3.0-or-later
 
 # Odoo Multi-Version Project Bootstrap Script - FIXED VERSION
 
@@ -305,7 +306,6 @@ print_status "PostgreSQL 17 auto-configured with ${SHARED_BUFFERS}MB shared_buff
 
 # Create config files and entrypoints for each version
 for version in "${VALID_VERSIONS[@]}"; do
-    PORT=$((8066 + version - 16))
     
     # Build addons path based on edition
     if [ "$ODOO_EDITION" = "enterprise" ]; then
